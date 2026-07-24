@@ -1,0 +1,79 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Page-1" id="sb4AY1QM8GamuInlU6bJ">
+    <mxGraphModel dx="1030" dy="562" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="z-IqwyQpF29cu17NNgFr-0" />
+        <mxCell id="z-IqwyQpF29cu17NNgFr-1" parent="z-IqwyQpF29cu17NNgFr-0" />
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-2" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-0" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-1" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-0" parent="z-IqwyQpF29cu17NNgFr-1" style="rounded=0;whiteSpace=wrap;html=1;" value="Home Page" vertex="1">
+          <mxGeometry height="30" width="120" x="340" y="10" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-4" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-3" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-1" parent="z-IqwyQpF29cu17NNgFr-1" style="rounded=0;whiteSpace=wrap;html=1;" value="Scan QR" vertex="1">
+          <mxGeometry height="30" width="120" x="340" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-6" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-5" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-3" parent="z-IqwyQpF29cu17NNgFr-1" style="rounded=0;whiteSpace=wrap;html=1;" value="Camera Opens" vertex="1">
+          <mxGeometry height="30" width="120" x="340" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-8" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-7" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-5" parent="z-IqwyQpF29cu17NNgFr-1" style="rounded=0;whiteSpace=wrap;html=1;" value="Scan QR" vertex="1">
+          <mxGeometry height="30" width="120" x="340" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-10" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-9" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-7" parent="z-IqwyQpF29cu17NNgFr-1" style="rounded=0;whiteSpace=wrap;html=1;" value="QR Detected" vertex="1">
+          <mxGeometry height="30" width="120" x="340" y="220" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-12" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-11" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-9" parent="z-IqwyQpF29cu17NNgFr-1" style="rounded=0;whiteSpace=wrap;html=1;" value="Scanning..." vertex="1">
+          <mxGeometry height="30" width="120" x="340" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-14" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-13" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-22" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-21" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-11" parent="z-IqwyQpF29cu17NNgFr-1" style="rhombus;whiteSpace=wrap;html=1;rounded=0;" value="Valid?" vertex="1">
+          <mxGeometry height="80" width="80" x="360" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-16" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-15" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-13" parent="z-IqwyQpF29cu17NNgFr-1" style="whiteSpace=wrap;html=1;rounded=0;" value="Reward Screen" vertex="1">
+          <mxGeometry height="20" width="120" x="480" y="410" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-18" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-17" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-15" parent="z-IqwyQpF29cu17NNgFr-1" style="whiteSpace=wrap;html=1;rounded=0;" value="Coins added to the Wallet" vertex="1">
+          <mxGeometry height="30" width="120" x="480" y="450" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-20" edge="1" parent="z-IqwyQpF29cu17NNgFr-1" source="qOCeGpzobHMBzeyPK9Dg-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="qOCeGpzobHMBzeyPK9Dg-19" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-17" parent="z-IqwyQpF29cu17NNgFr-1" style="whiteSpace=wrap;html=1;rounded=0;" value="Show updated Balance" vertex="1">
+          <mxGeometry height="30" width="120" x="480" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-19" parent="z-IqwyQpF29cu17NNgFr-1" style="whiteSpace=wrap;html=1;rounded=0;" value="Back to Home Page" vertex="1">
+          <mxGeometry height="30" width="120" x="480" y="550" as="geometry" />
+        </mxCell>
+        <mxCell id="qOCeGpzobHMBzeyPK9Dg-21" parent="z-IqwyQpF29cu17NNgFr-1" style="whiteSpace=wrap;html=1;rounded=0;" value="Show Error" vertex="1">
+          <mxGeometry height="20" width="120" x="190" y="410" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

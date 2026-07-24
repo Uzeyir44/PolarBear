@@ -1,0 +1,85 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Page-1" id="I3UIAAqoDwbNhChb4tJ8">
+    <mxGraphModel dx="1030" dy="562" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-3" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="sFve0vP3g5L9dvlXXHfV-2" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-1" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Home Page" vertex="1">
+          <mxGeometry height="20" width="120" x="340" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-5" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="sFve0vP3g5L9dvlXXHfV-4" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-2" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Followers" vertex="1">
+          <mxGeometry height="20" width="120" x="340" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-7" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="sFve0vP3g5L9dvlXXHfV-6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-9" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="sFve0vP3g5L9dvlXXHfV-8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-11" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="sFve0vP3g5L9dvlXXHfV-10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-4" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="List of Followers" vertex="1">
+          <mxGeometry height="20" width="120" x="340" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-13" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="sFve0vP3g5L9dvlXXHfV-12" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-6" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Tap Friend" vertex="1">
+          <mxGeometry height="20" width="120" x="50" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-8" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Unfollow Friend" vertex="1">
+          <mxGeometry height="20" width="120" x="340" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-26" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="sFve0vP3g5L9dvlXXHfV-25" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-10" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Make a VS with them" vertex="1">
+          <mxGeometry height="20" width="120" x="668" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-22" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="sFve0vP3g5L9dvlXXHfV-14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-23" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="sFve0vP3g5L9dvlXXHfV-15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-24" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="sFve0vP3g5L9dvlXXHfV-16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-12" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="See their profile" vertex="1">
+          <mxGeometry height="20" width="120" x="50" y="200" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-14" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="See their avatar&lt;span style=&quot;color: rgba(0, 0, 0, 0); font-family: monospace; font-size: 0px; text-align: start; white-space: nowrap;&quot;&gt;%3CmxGraphModel%3E%3Croot%3E%3CmxCell%20id%3D%220%22%2F%3E%3CmxCell%20id%3D%221%22%20parent%3D%220%22%2F%3E%3CmxCell%20id%3D%222%22%20parent%3D%221%22%20style%3D%22rounded%3D0%3BwhiteSpace%3Dwrap%3Bhtml%3D1%3B%22%20value%3D%22See%20their%20profile%22%20vertex%3D%221%22%3E%3CmxGeometry%20height%3D%2220%22%20width%3D%22120%22%20x%3D%2250%22%20y%3D%22200%22%20as%3D%22geometry%22%2F%3E%3C%2FmxCell%3E%3C%2Froot%3E%3C%2FmxGraphModel%3Ev&lt;/span&gt;&lt;span style=&quot;color: rgba(0, 0, 0, 0); font-family: monospace; font-size: 0px; text-align: start; white-space: nowrap;&quot;&gt;%3CmxGraphModel%3E%3Croot%3E%3CmxCell%20id%3D%220%22%2F%3E%3CmxCell%20id%3D%221%22%20parent%3D%220%22%2F%3E%3CmxCell%20id%3D%222%22%20parent%3D%221%22%20style%3D%22rounded%3D0%3BwhiteSpace%3Dwrap%3Bhtml%3D1%3B%22%20value%3D%22See%20their%20profile%22%20vertex%3D%221%22%3E%3CmxGeometry%20height%3D%2220%22%20width%3D%22120%22%20x%3D%2250%22%20y%3D%22200%22%20as%3D%22geometry%22%2F%3E%3C%2FmxCell%3E%3C%2Froot%3E%3C%2FmxGraphModel%3E&lt;/span&gt;" vertex="1">
+          <mxGeometry height="20" width="120" x="120" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-15" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="See followers &amp;amp; followings" vertex="1">
+          <mxGeometry height="30" width="120" x="120" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-18" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="sFve0vP3g5L9dvlXXHfV-17" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-20" edge="1" parent="1" source="sFve0vP3g5L9dvlXXHfV-16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" target="sFve0vP3g5L9dvlXXHfV-19" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-16" parent="1" style="rhombus;whiteSpace=wrap;html=1;shapeInside=1;" value="&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;Garderob Public?&lt;/div&gt;" vertex="1">
+          <mxGeometry height="80" width="80" x="140" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-17" parent="1" style="whiteSpace=wrap;html=1;" value="View Wardrobe" vertex="1">
+          <mxGeometry height="20" width="120" x="250" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-19" parent="1" style="whiteSpace=wrap;html=1;" value="Wardrobe is Private" vertex="1">
+          <mxGeometry height="20" width="120" x="120" y="470" as="geometry" />
+        </mxCell>
+        <mxCell id="sFve0vP3g5L9dvlXXHfV-25" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Pushed to the VS Page" vertex="1">
+          <mxGeometry height="30" width="120" x="668" y="210" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
