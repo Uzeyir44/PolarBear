@@ -9,6 +9,7 @@ erDiagram
     USERS ||--o{ COMPETITIONS : challenges
     USERS ||--o{ VOTES : casts
     USERS ||--o{ NOTIFICATIONS : receives
+    USERS ||--o{ DEVICE_TOKENS : registers
 
     AVATARS ||--o{ AVATAR_EQUIPMENT : has
     CLOTHING_ITEMS ||--o{ AVATAR_EQUIPMENT : equipped_as
@@ -121,4 +122,11 @@ erDiagram
     NOTIFICATION_TYPES {
         smallint type_id PK
         string type_name
+    }
+    DEVICE_TOKENS {
+        uuid device_id PK
+        uuid user_id FK
+        enum platform
+        string push_token
+        boolean is_active
     }

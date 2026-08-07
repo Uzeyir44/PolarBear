@@ -249,6 +249,21 @@ Each vote insert should, in the same transaction: insert a debit row into `coin_
 
 `metadata JSONB` is the one deliberate deviation from strict normalization: notification payloads vary per type (a competition notification needs a competition_id, a follow notification just needs actor_user_id) and new notification types will keep appearing per your roadmap. Rather than adding a new nullable FK column to this table for every future notification type, the type-specific reference IDs live in JSONB. `actor_user_id` stays a real FK because it's common to nearly every notification type and benefits from real referential integrity.
 
+### 2.19 `device_tokens`
+Push notification device registry.
+
+| Column | Type | Constraints |
+|---|---|---|
+| device_id | UUID | PK |
+| user_id | UUID | FK → users, NOT NULL |
+| platform | ENUM('ios','android') | NOT NULL |
+| push_token | TEXT | UNIQUE, NOT NULL |
+| is_active | BOOLEAN | NOT NULL, DEFAULT true |
+| last_seen_at | TIMESTAMPTZ | NOT NULL |
+| created_at | TIMESTAMPTZ | NOT NULL |
+
+A user can have multiple devices — no uniqueness on `user_id`. A logout/reinstall is an `UPDATE` on the existing row (matched by `push_token`, or by `user_id` + `platform` if you want at-most-one-active-token-per-platform later), not a new row. "Send to all active devices" is `WHERE user_id = ? AND is_active = true`.
+
 ---
 
 ## 3. Relationships & Cardinality
@@ -272,6 +287,7 @@ Each vote insert should, in the same transaction: insert a debit row into `coin_
 | competitions | votes | 1 : N | |
 | users | votes | 1 : N | as voter |
 | users | notifications | 1 : N | as recipient |
+| users | device_tokens | 1 : N | |
 
 ---
 
@@ -287,6 +303,7 @@ Beyond PK/UNIQUE indexes (which Postgres creates automatically):
 - `competitions(challenger_id)`, `competitions(opponent_id)` — "my competitions"
 - `competitions(status_id)` where status='active' — partial index, used constantly for the active-competition check
 - `notifications(user_id, is_read, created_at DESC)` — unread feed, the most common notification query
+- `device_tokens(user_id, is_active)` — "get all active devices for user" on every push send
 
 ---
 
@@ -302,6 +319,7 @@ Beyond PK/UNIQUE indexes (which Postgres creates automatically):
 | clothing_items → user_wardrobe / avatar_equipment | RESTRICT (a purchased/equipped item shouldn't vanish if the catalog entry is deleted — use `availability_status='unavailable'` instead of deleting) |
 | competitions → votes | CASCADE |
 | users → coin_transactions | RESTRICT (never delete a ledger row — this is your financial audit trail; deactivate the user instead via `is_active`) |
+| users → device_tokens | CASCADE (a device token is meaningless without the user) |
 
 In practice I'd expect this app to soft-delete users rather than hard-delete, given the ledger and competition history requirements — hard deletes and financial/audit tables don't mix well.
 
