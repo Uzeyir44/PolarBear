@@ -27,8 +27,10 @@ from .base import Base
 
 if TYPE_CHECKING:
     from .auth_provider import AuthProvider
+    from .avatar import Avatar
     from .device_token import DeviceToken
     from .follow import Follow
+    from .user_wardrobe import UserWardrobe
 
 
 class User(Base):
@@ -73,6 +75,12 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     device_tokens: Mapped[list["DeviceToken"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    avatar: Mapped["Avatar | None"] = relationship(
+        back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+    wardrobe: Mapped[list["UserWardrobe"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 

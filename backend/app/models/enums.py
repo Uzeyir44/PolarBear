@@ -19,3 +19,20 @@ class AuthProviderType(str, enum.Enum):
 class DevicePlatform(str, enum.Enum):
     IOS = "ios"
     ANDROID = "android"
+
+
+class AvatarSlot(str, enum.Enum):
+    """Shared by avatar_equipment.slot and clothing_categories.slot — a
+    category's slot determines which equipment slot its items can fill."""
+    HAIR = "hair"
+    HAT = "hat"
+    TOP = "top"
+    BOTTOM = "bottom"
+    SHOES = "shoes"
+    ACCESSORY = "accessory"
+
+
+class ClothingAvailability(str, enum.Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    UPCOMING = "upcoming"
