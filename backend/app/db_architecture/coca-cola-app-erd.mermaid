@@ -1,0 +1,132 @@
+erDiagram
+    USERS ||--o| AVATARS : owns
+    USERS ||--o{ AUTH_PROVIDERS : has
+    USERS ||--o{ USER_WARDROBE : purchases
+    USERS ||--o{ COIN_TRANSACTIONS : makes
+    USERS ||--o{ QR_CODES : redeems
+    USERS ||--o{ FOLLOWS : follows
+    USERS ||--o{ COMPETITION_REQUESTS : sends_receives
+    USERS ||--o{ COMPETITIONS : challenges
+    USERS ||--o{ VOTES : casts
+    USERS ||--o{ NOTIFICATIONS : receives
+    USERS ||--o{ DEVICE_TOKENS : registers
+
+    AVATARS ||--o{ AVATAR_EQUIPMENT : has
+    CLOTHING_ITEMS ||--o{ AVATAR_EQUIPMENT : equipped_as
+    CLOTHING_CATEGORIES ||--o{ CLOTHING_ITEMS : classifies
+    CLOTHING_ITEMS ||--o{ USER_WARDROBE : purchased_as
+
+    PRODUCTS ||--o{ QR_CODES : generates
+
+    COIN_TRANSACTION_TYPES ||--o{ COIN_TRANSACTIONS : categorizes
+
+    COMPETITION_REQUESTS ||--o| COMPETITIONS : accepted_into
+    COMPETITION_STATUS ||--o{ COMPETITIONS : has_status
+    COMPETITIONS ||--o{ VOTES : receives
+
+    NOTIFICATION_TYPES ||--o{ NOTIFICATIONS : categorizes
+
+    USERS {
+        uuid user_id PK
+        string username
+        string email
+        int coin_balance
+        int winning_streak
+    }
+    AVATARS {
+        uuid avatar_id PK
+        uuid user_id FK
+    }
+    AVATAR_EQUIPMENT {
+        uuid avatar_id PK,FK
+        enum slot PK
+        uuid item_id FK
+    }
+    CLOTHING_ITEMS {
+        uuid item_id PK
+        string name
+        int price
+        smallint category_id FK
+        uuid collection_id FK
+    }
+    CLOTHING_CATEGORIES {
+        smallint category_id PK
+        string category_name
+        enum slot
+    }
+    USER_WARDROBE {
+        uuid wardrobe_id PK
+        uuid user_id FK
+        uuid item_id FK
+    }
+    PRODUCTS {
+        uuid product_id PK
+        string name
+        string sku
+    }
+    QR_CODES {
+        uuid qr_id PK
+        string code
+        uuid product_id FK
+        enum status
+        uuid redeemed_by_user_id FK
+    }
+    COIN_TRANSACTIONS {
+        uuid transaction_id PK
+        uuid user_id FK
+        smallint type_id FK
+        int amount
+        int balance_after
+    }
+    COIN_TRANSACTION_TYPES {
+        smallint type_id PK
+        string type_name
+    }
+    FOLLOWS {
+        uuid follower_id PK,FK
+        uuid followee_id PK,FK
+    }
+    COMPETITION_REQUESTS {
+        uuid request_id PK
+        uuid challenger_id FK
+        uuid opponent_id FK
+        smallint duration_minutes
+        enum status
+    }
+    COMPETITIONS {
+        uuid competition_id PK
+        uuid request_id FK
+        uuid challenger_id FK
+        uuid opponent_id FK
+        smallint status_id FK
+        smallint duration_minutes
+        int prize_pool
+        uuid winner_id FK
+    }
+    COMPETITION_STATUS {
+        smallint status_id PK
+        string status_name
+    }
+    VOTES {
+        uuid vote_id PK
+        uuid competition_id FK
+        uuid voter_id FK
+        uuid voted_for_user_id FK
+    }
+    NOTIFICATIONS {
+        uuid notification_id PK
+        uuid user_id FK
+        smallint type_id FK
+        boolean is_read
+    }
+    NOTIFICATION_TYPES {
+        smallint type_id PK
+        string type_name
+    }
+    DEVICE_TOKENS {
+        uuid device_id PK
+        uuid user_id FK
+        enum platform
+        string push_token
+        boolean is_active
+    }
