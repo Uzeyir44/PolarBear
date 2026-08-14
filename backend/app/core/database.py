@@ -1,9 +1,19 @@
-"""
-Shared declarative base. Every model in this package inherits from this
-so they all register on the same MetaData — required for Alembic
-autogenerate and for cross-table relationships to resolve.
-"""
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+from app.core.config import settings
+
+
+engine = create_engine(
+    settings.database_url
+)
+
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False
+)
 
 
 class Base(DeclarativeBase):

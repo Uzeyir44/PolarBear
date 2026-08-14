@@ -48,7 +48,7 @@ class ClothingItem(Base):
     availability_status: Mapped[ClothingAvailability] = mapped_column(
         SQLEnum(ClothingAvailability, name="clothing_availability", native_enum=True),
         nullable=False,
-        server_default=ClothingAvailability.AVAILABLE.value,
+        server_default=ClothingAvailability.AVAILABLE.name,
     )
     # Extensibility hook — see docstring above. No FK constraint yet.
     collection_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

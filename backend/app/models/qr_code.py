@@ -33,7 +33,7 @@ class QRCode(Base):
     __table_args__ = (
         CheckConstraint("coin_value > 0", name="ck_qr_codes_coin_value_positive"),
         CheckConstraint(
-            "(status = 'redeemed') = (redeemed_by_user_id IS NOT NULL AND redeemed_at IS NOT NULL)",
+            "(status = 'REDEEMED') = (redeemed_by_user_id IS NOT NULL AND redeemed_at IS NOT NULL)",
             name="ck_qr_codes_redemption_fields_consistent",
         ),
     )
@@ -49,7 +49,7 @@ class QRCode(Base):
     status: Mapped[QRStatus] = mapped_column(
         SQLEnum(QRStatus, name="qr_status", native_enum=True),
         nullable=False,
-        server_default=QRStatus.ACTIVE.value,
+        server_default=QRStatus.ACTIVE.name,
     )
     redeemed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.user_id", ondelete="RESTRICT"), nullable=True

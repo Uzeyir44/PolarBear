@@ -59,7 +59,7 @@ class CompetitionRequest(Base):
     status: Mapped[CompetitionRequestStatus] = mapped_column(
         SQLEnum(CompetitionRequestStatus, name="competition_request_status", native_enum=True),
         nullable=False,
-        server_default=CompetitionRequestStatus.PENDING.value,
+        server_default=CompetitionRequestStatus.PENDING.name,
     )
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
     responded_at: Mapped[datetime | None] = mapped_column(nullable=True)
