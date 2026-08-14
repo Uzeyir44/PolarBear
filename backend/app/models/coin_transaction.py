@@ -9,11 +9,7 @@ balance in the same DB transaction.
 
 Reference columns are real FKs, not a polymorphic (reference_type,
 reference_id) pair — Postgres can validate a real FK; it can't
-validate a type-dependent one. vote_id and competition_id are plain
-nullable UUID columns for now (no FK) because `votes` and
-`competitions` don't exist yet — same extensibility pattern as
-`clothing_items.collection_id`. They become real FKs once that batch
-is built; flag it then so the migration adds the constraint.
+validate a type-dependent one.
 """
 from __future__ import annotations
 
@@ -62,9 +58,15 @@ class CoinTransaction(Base):
         ForeignKey("user_wardrobe.wardrobe_id", ondelete="RESTRICT"),
         nullable=True,
     )
-    # Plain columns, no FK yet — see module docstring.
-    vote_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    competition_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Now real FKs — votes/competitions exist as of this batch. If you're
+    # tracking this as an Alembic migration: this ALTERs the column to
+    # add the constraint, it doesn't recreate the column.
+    vote_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("votes.vote_id", ondelete="RESTRICT"), nullable=True
+    )
+    competition_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("competitions.competition_id", ondelete="RESTRICT"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), nullable=False, index=True

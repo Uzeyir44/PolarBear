@@ -50,3 +50,13 @@ class TransactionDirection(str, enum.Enum):
     that list grows (see coin_transaction_type.py)."""
     CREDIT = "credit"
     DEBIT = "debit"
+
+
+class CompetitionRequestStatus(str, enum.Enum):
+    """A native enum here, unlike competitions.status which is a lookup
+    table (competition_status.py) — this four-outcome set is closed and
+    unlikely to grow, per the design doc's split rationale."""
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    CANCELLED = "cancelled"

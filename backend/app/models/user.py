@@ -29,10 +29,13 @@ if TYPE_CHECKING:
     from .auth_provider import AuthProvider
     from .avatar import Avatar
     from .coin_transaction import CoinTransaction
+    from .competition import Competition
+    from .competition_request import CompetitionRequest
     from .device_token import DeviceToken
     from .follow import Follow
     from .qr_code import QRCode
     from .user_wardrobe import UserWardrobe
+    from .vote import Vote
 
 
 class User(Base):
@@ -87,6 +90,28 @@ class User(Base):
     )
     qr_codes_redeemed: Mapped[list["QRCode"]] = relationship(back_populates="redeemed_by")
     coin_transactions: Mapped[list["CoinTransaction"]] = relationship(back_populates="user")
+
+    sent_competition_requests: Mapped[list["CompetitionRequest"]] = relationship(
+        foreign_keys="CompetitionRequest.challenger_id", back_populates="challenger"
+    )
+    received_competition_requests: Mapped[list["CompetitionRequest"]] = relationship(
+        foreign_keys="CompetitionRequest.opponent_id", back_populates="opponent"
+    )
+    competitions_as_challenger: Mapped[list["Competition"]] = relationship(
+        foreign_keys="Competition.challenger_id", back_populates="challenger"
+    )
+    competitions_as_opponent: Mapped[list["Competition"]] = relationship(
+        foreign_keys="Competition.opponent_id", back_populates="opponent"
+    )
+    competitions_won: Mapped[list["Competition"]] = relationship(
+        foreign_keys="Competition.winner_id", back_populates="winner"
+    )
+    votes_cast: Mapped[list["Vote"]] = relationship(
+        foreign_keys="Vote.voter_id", back_populates="voter"
+    )
+    votes_received: Mapped[list["Vote"]] = relationship(
+        foreign_keys="Vote.voted_for_user_id", back_populates="voted_for"
+    )
 
     # Self-referential through Follow — two distinct relationships
     # because a user shows up in both the follower_id and followee_id

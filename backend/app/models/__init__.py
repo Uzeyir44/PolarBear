@@ -7,15 +7,18 @@ Batch 2 — avatar & clothing: avatars, clothing_categories,
 clothing_items, user_wardrobe, avatar_equipment.
 Batch 3 — QR/coins: products, qr_codes, coin_transaction_types,
 coin_transactions.
+Batch 4 — competitions: competition_requests, competition_status,
+competitions, votes.
 
-Everything else (competitions, votes, notifications) lands in later
-batches and will be added to these exports as it's written.
+Notifications is the last remaining batch and will be added to these
+exports once it's written.
 """
 from .base import Base
 from .enums import (
     AuthProviderType,
     AvatarSlot,
     ClothingAvailability,
+    CompetitionRequestStatus,
     DevicePlatform,
     QRStatus,
     TransactionDirection,
@@ -33,12 +36,17 @@ from .product import Product
 from .qr_code import QRCode
 from .coin_transaction_type import CoinTransactionType
 from .coin_transaction import CoinTransaction
+from .competition_status import CompetitionStatus
+from .competition_request import CompetitionRequest
+from .competition import Competition
+from .vote import Vote
 
 __all__ = [
     "Base",
     "AuthProviderType",
     "AvatarSlot",
     "ClothingAvailability",
+    "CompetitionRequestStatus",
     "DevicePlatform",
     "QRStatus",
     "TransactionDirection",
@@ -55,4 +63,8 @@ __all__ = [
     "QRCode",
     "CoinTransactionType",
     "CoinTransaction",
+    "CompetitionStatus",
+    "CompetitionRequest",
+    "Competition",
+    "Vote",
 ]
