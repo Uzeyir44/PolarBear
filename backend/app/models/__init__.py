@@ -1,5 +1,5 @@
 """
-ORM models.
+ORM models — complete schema, all 19 tables from the design doc.
 
 Batch 1 — core user/authentication: users, auth_providers,
 device_tokens, follows.
@@ -9,9 +9,13 @@ Batch 3 — QR/coins: products, qr_codes, coin_transaction_types,
 coin_transactions.
 Batch 4 — competitions: competition_requests, competition_status,
 competitions, votes.
+Batch 5 — notifications: notification_types, notifications.
 
-Notifications is the last remaining batch and will be added to these
-exports once it's written.
+Two Postgres triggers ship alongside the ORM definitions (see
+competition.py and vote.py) — they install automatically via
+`Base.metadata.create_all(engine)` through SQLAlchemy DDL events, but
+haven't been executed against a real Postgres instance yet. Verify
+them against an actual database before relying on them in production.
 """
 from .base import Base
 from .enums import (
@@ -40,6 +44,8 @@ from .competition_status import CompetitionStatus
 from .competition_request import CompetitionRequest
 from .competition import Competition
 from .vote import Vote
+from .notification_type import NotificationType
+from .notification import Notification
 
 __all__ = [
     "Base",
@@ -67,4 +73,6 @@ __all__ = [
     "CompetitionRequest",
     "Competition",
     "Vote",
+    "NotificationType",
+    "Notification",
 ]

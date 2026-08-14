@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .competition_request import CompetitionRequest
     from .device_token import DeviceToken
     from .follow import Follow
+    from .notification import Notification
     from .qr_code import QRCode
     from .user_wardrobe import UserWardrobe
     from .vote import Vote
@@ -111,6 +112,12 @@ class User(Base):
     )
     votes_received: Mapped[list["Vote"]] = relationship(
         foreign_keys="Vote.voted_for_user_id", back_populates="voted_for"
+    )
+    notifications_received: Mapped[list["Notification"]] = relationship(
+        foreign_keys="Notification.user_id", back_populates="user", cascade="all, delete-orphan"
+    )
+    notifications_triggered: Mapped[list["Notification"]] = relationship(
+        foreign_keys="Notification.actor_user_id", back_populates="actor"
     )
 
     # Self-referential through Follow — two distinct relationships
