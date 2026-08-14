@@ -36,3 +36,17 @@ class ClothingAvailability(str, enum.Enum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
     UPCOMING = "upcoming"
+
+
+class QRStatus(str, enum.Enum):
+    ACTIVE = "active"
+    REDEEMED = "redeemed"
+    EXPIRED = "expired"
+
+
+class TransactionDirection(str, enum.Enum):
+    """Direction on coin_transaction_types — a closed pair, unlike the
+    transaction TYPES themselves which live in a lookup table because
+    that list grows (see coin_transaction_type.py)."""
+    CREDIT = "credit"
+    DEBIT = "debit"

@@ -28,8 +28,10 @@ from .base import Base
 if TYPE_CHECKING:
     from .auth_provider import AuthProvider
     from .avatar import Avatar
+    from .coin_transaction import CoinTransaction
     from .device_token import DeviceToken
     from .follow import Follow
+    from .qr_code import QRCode
     from .user_wardrobe import UserWardrobe
 
 
@@ -83,6 +85,8 @@ class User(Base):
     wardrobe: Mapped[list["UserWardrobe"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    qr_codes_redeemed: Mapped[list["QRCode"]] = relationship(back_populates="redeemed_by")
+    coin_transactions: Mapped[list["CoinTransaction"]] = relationship(back_populates="user")
 
     # Self-referential through Follow — two distinct relationships
     # because a user shows up in both the follower_id and followee_id
