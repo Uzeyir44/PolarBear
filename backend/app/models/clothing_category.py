@@ -13,7 +13,7 @@ from sqlalchemy import Enum as SQLEnum
 from sqlalchemy import SmallInteger
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .base import Base
+from app.core.database import Base
 from .enums import AvatarSlot
 
 if TYPE_CHECKING:

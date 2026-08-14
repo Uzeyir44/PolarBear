@@ -17,7 +17,7 @@ competition.py and vote.py) — they install automatically via
 haven't been executed against a real Postgres instance yet. Verify
 them against an actual database before relying on them in production.
 """
-from .base import Base
+from app.core.database import Base
 from .enums import (
     AuthProviderType,
     AvatarSlot,

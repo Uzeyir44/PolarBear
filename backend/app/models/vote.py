@@ -30,7 +30,7 @@ from sqlalchemy import CheckConstraint, DDL, ForeignKey, UniqueConstraint, event
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .base import Base
+from app.core.database import Base
 
 if TYPE_CHECKING:
     from .competition import Competition

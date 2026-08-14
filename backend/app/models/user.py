@@ -23,7 +23,7 @@ from sqlalchemy import CheckConstraint, text
 from sqlalchemy.dialects.postgresql import CITEXT, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .base import Base
+from app.core.database import Base
 
 if TYPE_CHECKING:
     from .auth_provider import AuthProvider

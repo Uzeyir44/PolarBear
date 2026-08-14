@@ -20,7 +20,7 @@ from sqlalchemy import ForeignKey, SmallInteger, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .base import Base
+from app.core.database import Base
 from .enums import ClothingAvailability
 
 if TYPE_CHECKING:

@@ -21,7 +21,7 @@ from sqlalchemy import CheckConstraint, ForeignKey, Index, SmallInteger, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .base import Base
+from app.core.database import Base
 
 if TYPE_CHECKING:
     from .coin_transaction_type import CoinTransactionType
