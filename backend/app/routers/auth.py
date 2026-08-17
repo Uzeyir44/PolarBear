@@ -1,17 +1,21 @@
 """
 Authentication routes.
 
-For now this only covers registration. Login, tokens, and OAuth come in
-later batches — deliberately not implemented here.
+Registration and login. Access tokens are returned on login and then used
+by protected endpoints through get_current_user(). Refresh tokens, Google/
+Apple login, logout/session revocation, and MFA are deliberately not part
+of the MVP and are not implemented here.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.security import password_hasher
+from app.core.jwt import create_access_token
+from app.core.security import hash_password, verify_password
 from app.models import User
+from app.schemas.token import LoginRequest, Token
 from app.schemas.user import UserRead, UserRegister
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -44,7 +48,7 @@ def register(payload: UserRegister, db: Session = Depends(get_db)) -> User:
     user = User(
         username=payload.username,
         email=payload.email,
-        password_hash=password_hasher.hash(payload.password),
+        password_hash=hash_password(payload.password),
     )
 
     try:
@@ -56,6 +60,30 @@ def register(payload: UserRegister, db: Session = Depends(get_db)) -> User:
 
     db.refresh(user)
     return user
+
+
+@router.post("/login", response_model=Token)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> Token:
+    user = db.execute(
+        select(User).where(
+            or_(User.username == payload.username, User.email == payload.username)
+        )
+    ).scalar_one_or_none()
+
+    # One message for both "bad user" and "bad password" so an attacker
+    # can't tell from the error whether an account exists (no enumeration).
+    if (
+        user is None
+        or user.password_hash is None
+        or not verify_password(payload.password, user.password_hash)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return Token(access_token=create_access_token(user.user_id))
 
 
 def _duplicate_http_exception(exc: IntegrityError) -> HTTPException:

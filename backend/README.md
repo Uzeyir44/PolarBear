@@ -12,6 +12,7 @@ Backend for the CCI / MyColaBear application built with **FastAPI**, **SQLAlchem
 | Migrations | Alembic |
 | Settings | Pydantic v2 + `pydantic-settings` (from `.env`) |
 | Password hashing | `pwdlib` with Argon2id |
+| JWT | PyJWT (HS256, signed with the secret in `.env`) |
 | Input/output validation | Pydantic schemas |
 
 ## Setup
@@ -21,10 +22,14 @@ Backend for the CCI / MyColaBear application built with **FastAPI**, **SQLAlchem
    CREATE DATABASE cci_db;
    CREATE EXTENSION IF NOT EXISTS citext;
    ```
-2. Copy the connection string into `.env`:
+2. Copy the values into `.env`:
    ```
    DATABASE_URL=postgresql+psycopg://postgres:<password>@localhost:5432/cci_db
+   SECRET_KEY=<random secret string>
+   ACCESS_TOKEN_EXPIRE_MINUTES=30
    ```
+   - `SECRET_KEY` — signs JWT access tokens. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(64))"`. It must stay secret and is gitignored (never commit `.env`).
+   - `ACCESS_TOKEN_EXPIRE_MINUTES` — how many minutes a login token stays valid before the client must log in again.
 3. Run database migrations:
    ```bash
    venv/Scripts/alembic upgrade head
@@ -44,17 +49,22 @@ venv/Scripts/uvicorn app.main:app --reload
 ```
 app/
 ├── main.py               # FastAPI app; mounts routers; health check
+├── dependencies.py       # get_current_user() — reusable JWT auth gate
 ├── core/
-│   ├── config.py         # Settings (reads DATABASE_URL from .env)
+│   ├── config.py         # Settings (reads DATABASE_URL, SECRET_KEY from .env)
 │   ├── database.py       # engine, SessionLocal, Base, get_db() dependency
-│   └── security.py       # PasswordHasher (Argon2id hashing/verification)
+│   ├── security.py       # Argon2id hashing (PasswordHasher, hash/verify_password)
+│   └── jwt.py            # create/decode access tokens (PyJWT)
 ├── models/               # SQLAlchemy ORM models — 19 tables (complete schema)
 ├── schemas/
-│   └── user.py           # Pydantic schemas: UserRegister (input), UserRead (output)
+│   ├── user.py           # UserRegister (input), UserRead (output)
+│   └── token.py          # LoginRequest (input), Token (output)
 ├── routers/
-│   └── auth.py           # POST /auth/register
+│   ├── auth.py           # POST /auth/register, POST /auth/login
+│   └── users.py          # GET /users/me (protected)
 ├── test_db.py            # Manual DB connectivity check
-└── test_register.py      # End-to-end registration checks
+├── test_register.py      # End-to-end registration checks
+└── test_auth_flow.py     # End-to-end login + JWT checks
 alembic/                  # Migrations (initial_schema)
 ```
 
@@ -68,7 +78,6 @@ alembic/                  # Migrations (initial_schema)
 - Alembic migrations with the full 19-table schema (users, avatars, wardrobe, coins, QR codes, competitions, votes, notifications, etc.).
 
 ### User registration (`POST /auth/register`)
-The first part of the authentication system. Login, JWT, and refresh tokens are **not** implemented yet.
 
 Request body:
 
@@ -108,12 +117,69 @@ Example response (`201 Created`):
 ### Health check (`GET /health/db`)
 Runs `SELECT 1` against PostgreSQL through FastAPI → SQLAlchemy → DB to confirm the full connectivity stack works. Returns `{"database": "ok", "result": 1}`.
 
+### Login (`POST /auth/login`)
+Authenticates the user and issues a JWT access token.
+
+Request body (`LoginRequest`):
+
+```json
+{
+  "username": "polar_bear",
+  "email": "user@example.com",
+  "password": "a-strong-password"
+}
+```
+
+The `username` field accepts either a username or an email.
+
+Flow:
+1. Find the user by username or email (CITEXT → case-insensitive).
+2. Verify the password against the stored Argon2 hash with `verify_password()`.
+3. Fail with `401 Unauthorized` on bad credentials. The same message is used for "user not found" and "wrong password" so attackers can't enumerate accounts.
+4. On success, sign a JWT with PyJWT (HS256) and return it.
+
+Response (`200 OK`):
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…",
+  "token_type": "bearer"
+}
+```
+
+### Token contents (`app/core/jwt.py`)
+
+The JWT carries only three claims — no password, no hash, no profile data:
+
+- `sub` — the user's `user_id` (the "subject" of the token; this is how the backend identifies the user).
+- `iat` — issued-at timestamp.
+- `exp` — expiry timestamp (`now + ACCESS_TOKEN_EXPIRE_MINUTES`). PyJWT refuses to decode an expired token.
+
+The token is signed with `SECRET_KEY` using HS256. Anyone with the secret can mint tokens, so it must never leak or be committed.
+
+### Protecting endpoints (`app/dependencies.py`)
+
+`get_current_user()` is a reusable dependency that any endpoint can declare:
+
+```python
+current_user: User = Depends(get_current_user)
+```
+
+It: reads the `Authorization: Bearer <token>` header → decodes and validates the JWT → extracts `sub` as a `UUID` → loads the user from Postgres → returns the `User`. If the token is missing, invalid, expired, or belongs to a nonexistent/inactive user, it raises `401 Unauthorized`.
+
+### Current user (`GET /users/me`)
+
+The first protected endpoint — the pattern for every future one. Requires `Authorization: Bearer <token>` and returns the same safe `UserRead` shape as registration.
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
 - Only the hash is stored in `users.password_hash`.
 - Hashes are never returned by the API (`password_hash` is not a field in `UserRead`).
 - Passwords are never logged.
+- The JWT secret lives only in `.env` (gitignored) — it is not hardcoded in source.
+- JWTs contain only `sub`/`iat`/`exp`; no password, hash, or sensitive profile data.
+- The same `401` message covers wrong password and unknown user (no account enumeration).
 
 ## Tests
 
@@ -125,6 +191,18 @@ venv/Scripts/python -m app.test_db
 
 # Registration end-to-end (creates unique test users, then deletes them)
 venv/Scripts/python -m app.test_register
+
+# Login + JWT end-to-end (register -> login -> /users/me, plus 401 cases)
+venv/Scripts/python -m app.test_auth_flow
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
+
+`test_auth_flow.py` verifies: login returns a token, the JWT contains only `sub`/`iat`/`exp` with no sensitive data, `GET /users/me` works with a valid token, and returns `401` for wrong password, nonexistent user, missing/invalid/expired token, and inactive users. All test users are cleaned up afterward.
+
+## Postman test sequence
+
+1. `POST /auth/register` with `{username, email, password}` → `201`.
+2. `POST /auth/login` with `{username, password}` → copy `access_token`.
+3. `GET /users/me` with header `Authorization: Bearer <token>` → `200` with the user's profile.
+4. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`.
