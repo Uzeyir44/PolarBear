@@ -57,15 +57,16 @@ app/
 │   └── jwt.py            # create/decode access tokens (PyJWT)
 ├── models/               # SQLAlchemy ORM models — 19 tables (complete schema)
 ├── schemas/
-│   ├── user.py           # UserRegister/UserUpdate (input), UserRead (output)
+│   ├── user.py           # UserRegister/UserUpdate (input), UserRead/UserPublic (output)
 │   └── token.py          # LoginRequest (input), Token (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
-│   └── users.py          # GET /users/me, PATCH /users/me (protected)
+│   └── users.py          # GET /users/me, PATCH /users/me, GET /users/search (protected)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
 ├── test_auth_flow.py     # End-to-end login + JWT checks
-└── test_update_profile.py# End-to-end PATCH /users/me checks
+├── test_update_profile.py# End-to-end PATCH /users/me checks
+└── test_user_search.py   # End-to-end GET /users/search checks
 alembic/                  # Migrations (initial_schema)
 ```
 
@@ -218,6 +219,52 @@ Protected fields (`user_id`, `email`, `password_hash`, `coin_balance`, `winning_
 
 Response is the same safe `UserRead` shape as `GET /users/me` and registration (now includes `biography` and `profile_picture_url`) — `password_hash` is never exposed.
 
+### User search (`GET /users/search?q=<query>`)
+
+Lets any authenticated user find **other** users by partial username match. The caller is always excluded from their own results. Requires `Authorization: Bearer <token>`.
+
+Query parameters (validated by FastAPI):
+
+| Param | Rules |
+| --- | --- |
+| `q` | Required. 1–30 chars. Matches a username that **contains** the fragment anywhere (prefix, middle, or suffix). Case-insensitive. Missing/empty/too-long → `422`. |
+| `limit` | Optional, default `20`, min `1`, max `20`. Caps how many results are returned. Out of range → `422`. |
+
+Example:
+
+```
+GET /users/search?q=alex
+Authorization: Bearer <JWT>
+```
+
+```json
+[
+  {
+    "user_id": "…",
+    "username": "alex123",
+    "profile_picture_url": null,
+    "biography": "Hello!"
+  },
+  {
+    "user_id": "…",
+    "username": "alex_dev",
+    "profile_picture_url": "https://example.com/avatar.jpg",
+    "biography": null
+  }
+]
+```
+
+Flow:
+1. Validate `q`/`limit` via `Query` constraints → `422` on bad input.
+2. Authenticate through `get_current_user()`; failure → `401`.
+3. Build the pattern `%q%` with `ILIKE` (case-insensitive; the `CITEXT` column already folds case, this just makes the intent explicit) and escape `%`, `_`, `\` so the query is matched literally.
+4. `select(User)` filtered by active, not-self, and the `ILIKE` match, ordered by username and `LIMIT`ed to `limit`.
+5. Return the rows through the `UserPublic` response model.
+
+Response uses a dedicated **`UserPublic`** schema that exposes exactly four fields — `user_id`, `username`, `profile_picture_url`, `biography`. It deliberately omits `email`, `is_active`, `created_at`, and never contains `password_hash`, `coin_balance`, or `winning_streak`.
+
+Search strategy tradeoff: a `%q%` (substring-anywhere) pattern **cannot use the btree index** on `users.username` — the btree only accelerates exact and `q%` prefix matches via range scans. `%q%` therefore does a sequential scan. That's fine at this project's scale; the upgrade path if the user table grows large (≈100k+ rows) is the `pg_trgm` extension plus a GIN index with `gin_trgm_ops` on `username`. It was deliberately **not** added now because it costs extra disk space and slower writes for no benefit at the current size. (Full reasoning is in `app/routers/users.py`.)
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -244,6 +291,10 @@ venv/Scripts/python -m app.test_auth_flow
 
 # PATCH /users/me end-to-end (single/multi-field update, duplicates, 401s, 422s)
 venv/Scripts/python -m app.test_update_profile
+
+# GET /users/search end-to-end (partial/case-insensitive match, 401s, 422s,
+# self-exclusion, inactive users, public-field-only responses)
+venv/Scripts/python -m app.test_user_search
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -252,10 +303,13 @@ venv/Scripts/python -m app.test_update_profile
 
 `test_update_profile.py` verifies: updating one field leaves the others unchanged (username/biography/profile updates all persisted to the DB), clearing a field with `null`, duplicate username → `409` (including the case-insensitive `CITEXT` case), reusing your own username allowed, missing token → `401`, empty/invalid/`null` username → `422`, and no `password_hash` in the response. All test users are cleaned up afterward.
 
+`test_user_search.py` verifies: partial (prefix and mid-string) matches, case-insensitive matching, no matches → `[]`, the caller excluded from their own results, missing/invalid/expired token → `401`, missing/empty/too-long `q` → `422`, `limit` bounds → `422`, inactive users excluded, `%`-wildcards treated literally, and responses exposing only the four public fields. All test users are cleaned up afterward.
+
 ## Postman test sequence
 
 1. `POST /auth/register` with `{username, email, password}` → `201`.
 2. `POST /auth/login` with `{username, password}` → copy `access_token`.
 3. `GET /users/me` with header `Authorization: Bearer <token>` → `200` with the user's profile.
 4. `PATCH /users/me` with header `Authorization: Bearer <token>` and a body like `{"biography": "My new biography"}` → `200` with the updated profile.
-5. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`, duplicate username → `409`, `{"username": ""}` → `422`.
+5. `GET /users/search?q=alex` with header `Authorization: Bearer <token>` → `200` with a list of matching public profiles (excludes yourself).
+6. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`, duplicate username → `409`, `{"username": ""}` → `422`, search with `q=` (empty) → `422`.

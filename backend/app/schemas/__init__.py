@@ -1,4 +1,4 @@
 from .token import LoginRequest, Token
-from .user import UserRead, UserRegister, UserUpdate
+from .user import UserPublic, UserRead, UserRegister, UserUpdate
 
-__all__ = ["LoginRequest", "Token", "UserRead", "UserRegister", "UserUpdate"]
+__all__ = ["LoginRequest", "Token", "UserPublic", "UserRead", "UserRegister", "UserUpdate"]

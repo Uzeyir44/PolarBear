@@ -77,3 +77,20 @@ class UserRead(BaseModel):
     profile_picture_url: str | None = None
     is_active: bool
     created_at: datetime
+
+
+class UserPublic(BaseModel):
+    """Public profile shown to OTHER users (search results, profiles).
+
+    Deliberately narrower than UserRead — it omits email, is_active, and
+    created_at because those belong to the account owner, not the public.
+    It is the response_model for search, so only the fields listed here can
+    ever appear; password_hash is simply not in the schema.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: UUID
+    username: str
+    profile_picture_url: str | None = None
+    biography: str | None = None
