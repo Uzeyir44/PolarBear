@@ -57,14 +57,15 @@ app/
 │   └── jwt.py            # create/decode access tokens (PyJWT)
 ├── models/               # SQLAlchemy ORM models — 19 tables (complete schema)
 ├── schemas/
-│   ├── user.py           # UserRegister (input), UserRead (output)
+│   ├── user.py           # UserRegister/UserUpdate (input), UserRead (output)
 │   └── token.py          # LoginRequest (input), Token (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
-│   └── users.py          # GET /users/me (protected)
+│   └── users.py          # GET /users/me, PATCH /users/me (protected)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
-└── test_auth_flow.py     # End-to-end login + JWT checks
+├── test_auth_flow.py     # End-to-end login + JWT checks
+└── test_update_profile.py# End-to-end PATCH /users/me checks
 alembic/                  # Migrations (initial_schema)
 ```
 
@@ -171,6 +172,52 @@ It: reads the `Authorization: Bearer <token>` header → decodes and validates t
 
 The first protected endpoint — the pattern for every future one. Requires `Authorization: Bearer <token>` and returns the same safe `UserRead` shape as registration.
 
+### Update profile (`PATCH /users/me`)
+
+Lets the authenticated user update their own profile. Requires `Authorization: Bearer <token>`; without it (or with an invalid/expired token) it returns `401`.
+
+Request body (`UserUpdate`) — every field is optional, so the client sends only what it wants to change:
+
+```json
+{
+  "username": "new_username"
+}
+```
+
+```json
+{
+  "biography": "My new biography"
+}
+```
+
+```json
+{
+  "username": "new_username",
+  "biography": "My new biography",
+  "profile_picture_url": "https://example.com/avatar.jpg"
+}
+```
+
+Updatable fields:
+
+| Field | Rules |
+| --- | --- |
+| `username` | Same constraints as registration (3–30 chars, letters/digits/underscore). Must be unique (`409` on a duplicate, case-insensitive because of `CITEXT`). Can't be `null` — sending `{"username": null}` is a `422` validation error. |
+| `biography` | Optional text, max 500 chars. Send `null` to clear it. |
+| `profile_picture_url` | Optional URL string, max 2048 chars. Send `null` to clear it. |
+
+Flow:
+1. Validate the body with Pydantic (`UserUpdate`); invalid data → `422`.
+2. Authenticate through `get_current_user()`; failure → `401`.
+3. `payload.model_dump(exclude_unset=True)` — a dict containing **only** the fields the client actually sent. Omitted fields are never written, so a single-field PATCH leaves the others untouched. Sending explicit `null` is a value, so it clears `biography`/`profile_picture_url`.
+4. If `username` is present, pre-check the unique constraint with a `select`. Reusing your own username is allowed; a username owned by another user → `409 Conflict`.
+5. Apply the supplied fields, `commit()`, then `refresh()` and return the row.
+6. A database `IntegrityError` (a concurrent request grabbed the username between the check and the commit) is rolled back and mapped to the same `409`.
+
+Protected fields (`user_id`, `email`, `password_hash`, `coin_balance`, `winning_streak`, `is_active`, `created_at`) are **not** part of `UserUpdate` — they are owned by other parts of the system and can never be changed through this endpoint.
+
+Response is the same safe `UserRead` shape as `GET /users/me` and registration (now includes `biography` and `profile_picture_url`) — `password_hash` is never exposed.
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -194,15 +241,21 @@ venv/Scripts/python -m app.test_register
 
 # Login + JWT end-to-end (register -> login -> /users/me, plus 401 cases)
 venv/Scripts/python -m app.test_auth_flow
+
+# PATCH /users/me end-to-end (single/multi-field update, duplicates, 401s, 422s)
+venv/Scripts/python -m app.test_update_profile
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
 
 `test_auth_flow.py` verifies: login returns a token, the JWT contains only `sub`/`iat`/`exp` with no sensitive data, `GET /users/me` works with a valid token, and returns `401` for wrong password, nonexistent user, missing/invalid/expired token, and inactive users. All test users are cleaned up afterward.
 
+`test_update_profile.py` verifies: updating one field leaves the others unchanged (username/biography/profile updates all persisted to the DB), clearing a field with `null`, duplicate username → `409` (including the case-insensitive `CITEXT` case), reusing your own username allowed, missing token → `401`, empty/invalid/`null` username → `422`, and no `password_hash` in the response. All test users are cleaned up afterward.
+
 ## Postman test sequence
 
 1. `POST /auth/register` with `{username, email, password}` → `201`.
 2. `POST /auth/login` with `{username, password}` → copy `access_token`.
 3. `GET /users/me` with header `Authorization: Bearer <token>` → `200` with the user's profile.
-4. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`.
+4. `PATCH /users/me` with header `Authorization: Bearer <token>` and a body like `{"biography": "My new biography"}` → `200` with the updated profile.
+5. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`, duplicate username → `409`, `{"username": ""}` → `422`.
