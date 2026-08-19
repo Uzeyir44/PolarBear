@@ -61,12 +61,13 @@ app/
 │   └── token.py          # LoginRequest (input), Token (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
-│   └── users.py          # GET /users/me, PATCH /users/me, GET /users/search (protected)
+│   └── users.py          # /users/me, PATCH /users/me, /users/search, follow/unfollow/follow-status (protected)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
 ├── test_auth_flow.py     # End-to-end login + JWT checks
 ├── test_update_profile.py# End-to-end PATCH /users/me checks
-└── test_user_search.py   # End-to-end GET /users/search checks
+├── test_user_search.py   # End-to-end GET /users/search checks
+└── test_follow.py        # End-to-end follow/unfollow/follow-status checks
 alembic/                  # Migrations (initial_schema)
 ```
 
@@ -265,6 +266,81 @@ Response uses a dedicated **`UserPublic`** schema that exposes exactly four fiel
 
 Search strategy tradeoff: a `%q%` (substring-anywhere) pattern **cannot use the btree index** on `users.username` — the btree only accelerates exact and `q%` prefix matches via range scans. `%q%` therefore does a sequential scan. That's fine at this project's scale; the upgrade path if the user table grows large (≈100k+ rows) is the `pg_trgm` extension plus a GIN index with `gin_trgm_ops` on `username`. It was deliberately **not** added now because it costs extra disk space and slower writes for no benefit at the current size. (Full reasoning is in `app/routers/users.py`.)
 
+## Follow / Unfollow
+
+Three protected endpoints let an authenticated user follow another user, stop following them, and check whether they currently follow them. The database already contained the `follows` table (composite primary key `(follower_id, followee_id)`, a CHECK constraint blocking self-follows, `created_at`, and cascade deletes on both FKs) — **no schema change or migration was needed**.
+
+### Follow a user (`POST /users/{user_id}/follow`)
+
+Creates a follow relationship from the authenticated user to the user named in the URL.
+
+Flow:
+1. Authenticate via `get_current_user()`; no/invalid/expired token → `401`.
+2. FastAPI parses `user_id` from the URL as a `uuid.UUID`.
+3. Load the target user with `db.get(User, user_id)`; missing → `404`.
+4. Reject inactive targets → `400` (deactivated accounts can't be followed).
+5. Reject following yourself → `400` (also guaranteed by the DB CHECK constraint `ck_follows_no_self_follow`).
+6. Check for an existing row with `db.get(Follow, (current_user.user_id, user_id))`; already following → `409`.
+7. Insert a `Follow(follower_id=current_user.user_id, followee_id=user_id)` and commit.
+8. On a DB `IntegrityError` (a concurrent request inserted the same row between the check and the commit) → rollback and return the same `409`.
+
+Response (`201 Created`):
+
+```json
+{ "is_following": true }
+```
+
+### Unfollow a user (`DELETE /users/{user_id}/follow`)
+
+Removes the follow relationship if it exists.
+
+Flow:
+1. Authenticate via `get_current_user()`; failure → `401`.
+2. Look up the row with `db.get(Follow, (current_user.user_id, user_id))`; not following → `404` (this also covers a target that doesn't exist — a follow row can't point at a deleted user because of `ON DELETE CASCADE`).
+3. `db.delete(follow)` and commit.
+
+Response (`200 OK`):
+
+```json
+{ "is_following": false }
+```
+
+### Follow status (`GET /users/{user_id}/follow-status`)
+
+Tells the authenticated user whether they currently follow the target.
+
+Flow:
+1. Authenticate via `get_current_user()`; failure → `401`.
+2. Return `true` if a `Follow` row exists for `(current_user.user_id, user_id)`, else `false`.
+
+Response (`200 OK`):
+
+```json
+{ "is_following": true }
+```
+
+### Why the follower always comes from the JWT
+
+The endpoints declare **no request body**. The follower is derived only from:
+
+```
+Authorization: Bearer <JWT>
+   ↓
+get_current_user()
+   ↓
+current_user.user_id
+   ↓
+follower_id  (in the Follow row)
+```
+
+The **only** user ID the client controls is the followee in the URL (`user_id`). If a client sends a body like `{"follower_id": "<someone else>"}`, FastAPI simply ignores it — there is no field to set it from, so a follower can never be forged.
+
+### How duplicate follows are prevented
+
+Two layers:
+1. **Database level (the real guarantee):** the `follows` table's composite primary key on `(follower_id, followee_id)` makes a second identical follow structurally impossible — the INSERT would violate the PK.
+2. **Application level (the friendly error):** the endpoint pre-checks the same tuple with `db.get(Follow, ...)` and returns `409 Conflict` instead of letting the raw constraint error surface. The `IntegrityError` fallback covers the race where two concurrent requests pass the pre-check before either commits.
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -295,6 +371,10 @@ venv/Scripts/python -m app.test_update_profile
 # GET /users/search end-to-end (partial/case-insensitive match, 401s, 422s,
 # self-exclusion, inactive users, public-field-only responses)
 venv/Scripts/python -m app.test_user_search
+
+# Follow/unfollow end-to-end (valid follow, duplicates, self-follow, 404s,
+# 400s, 401s, follow-status, body-supplied follower_id ignored)
+venv/Scripts/python -m app.test_follow
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -305,6 +385,31 @@ venv/Scripts/python -m app.test_user_search
 
 `test_user_search.py` verifies: partial (prefix and mid-string) matches, case-insensitive matching, no matches → `[]`, the caller excluded from their own results, missing/invalid/expired token → `401`, missing/empty/too-long `q` → `422`, `limit` bounds → `422`, inactive users excluded, `%`-wildcards treated literally, and responses exposing only the four public fields. All test users are cleaned up afterward.
 
+`test_follow.py` verifies: missing/invalid/expired token → `401`, follow nonexistent user → `404`, follow inactive user → `400`, follow yourself → `400`, valid follow → `201` with the row actually in the DB, duplicate follow → `409` with no duplicate row, a body-supplied `follower_id` is ignored (the follower always comes from the JWT), follow-status returns `is_following: true`/`false`, unfollow someone not followed → `404`, valid unfollow → `200` with the row actually deleted, unfollow again → `404`, and a second user can follow the same target. All test users (and their follow rows, via cascade) are cleaned up afterward.
+
+## Test users
+
+Three fixed accounts to use for all manual testing (Postman, cURL, etc.). They are **not** seeded into the database — you must register each one once with `POST /auth/register`. They persist after that, so you can log in with the same credentials every time and never have to re-register.
+
+| Username | Email | Password | Role |
+| --- | --- | --- | --- |
+| `alice` | `alice@example.com` | `Password123!` | The follower — logs in and performs follow/unfollow |
+| `bob` | `bob@example.com` | `Password123!` | The followee — the target Alice follows |
+| `carol` | `carol@example.com` | `Password123!` | A third account for cross-checks (e.g. "not followed" → 404, search hits) |
+
+Register all three once:
+
+```json
+POST /auth/register
+{ "username": "alice", "email": "alice@example.com", "password": "Password123!" }
+{ "username": "bob",   "email": "bob@example.com",   "password": "Password123!" }
+{ "username": "carol", "email": "carol@example.com", "password": "Password123!" }
+```
+
+Notes:
+- If a username is already taken (e.g. a previous run left one behind), registration returns `409` — just log in with those credentials instead.
+- To discover a user's `user_id`, log in and call `GET /users/me`, or search with `GET /users/search?q=bob`.
+
 ## Postman test sequence
 
 1. `POST /auth/register` with `{username, email, password}` → `201`.
@@ -313,3 +418,25 @@ venv/Scripts/python -m app.test_user_search
 4. `PATCH /users/me` with header `Authorization: Bearer <token>` and a body like `{"biography": "My new biography"}` → `200` with the updated profile.
 5. `GET /users/search?q=alex` with header `Authorization: Bearer <token>` → `200` with a list of matching public profiles (excludes yourself).
 6. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`, duplicate username → `409`, `{"username": ""}` → `422`, search with `q=` (empty) → `422`.
+
+### Complete follow flow (uses the test users above)
+
+1. Log in as **alice** (`POST /auth/login` with `{username: "alice", password: "Password123!"}`) and copy her `access_token`.
+2. Log in as **bob** and call `GET /users/me` to get his `user_id`, or search from alice's account with `GET /users/search?q=bob`.
+3. `POST /users/{bob_user_id}/follow` with alice's `Authorization: Bearer <token>` → `201` with `{"is_following": true}`.
+4. `GET /users/{bob_user_id}/follow-status` with the same token → `200` with `{"is_following": true}`.
+5. `DELETE /users/{bob_user_id}/follow` with the same token → `200` with `{"is_following": false}`.
+6. `GET /users/{bob_user_id}/follow-status` again → `200` with `{"is_following": false}`.
+
+Follow negative cases to try:
+- Repeat step 3 twice → second call is `409`.
+- `POST /users/{alice_user_id}/follow` (alice following herself) → `400`.
+- `POST /users/{nonexistent_uuid}/follow` → `404`.
+- `DELETE /users/{carol_user_id}/follow` when alice is not following carol → `404`.
+- Call any follow endpoint without the `Authorization` header → `401`.
+
+Verify directly in the database:
+
+```sql
+SELECT * FROM follows;
+```

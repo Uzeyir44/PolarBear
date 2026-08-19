@@ -15,6 +15,19 @@ GET /search lets any authenticated user find OTHER users by partial
 username match, returning only public profile fields. The caller is
 excluded from its own results.
 
+Follow endpoints (all authenticated, all use the URL's user_id as the
+followee):
+  - POST   /users/{user_id}/follow  create a follow relationship (201).
+  - DELETE /users/{user_id}/follow  remove it (200).
+  - GET    /users/{user_id}/follow-status  report whether the caller
+           follows the user (200, {"is_following": bool}).
+
+The follower is ALWAYS current_user.user_id from the JWT. The endpoint
+declares no request body, so a client-supplied follower_id cannot affect
+the operation. Duplicate follows are prevented structurally by the
+composite primary key on (follower_id, followee_id); the application
+pre-check just converts that into a friendly 409.
+
 Search strategy tradeoff
 ------------------------
 User search uses ILIKE '%q%' (case-insensitive substring match; the
@@ -36,6 +49,8 @@ extension, and only starts paying off once the active-user table is large
 tens of thousands of users is sub-millisecond, so we keep the simple
 query and add pg_trgm later if search becomes a bottleneck.
 """
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -43,8 +58,8 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import User
-from app.schemas.user import UserPublic, UserRead, UserUpdate
+from app.models import Follow, User
+from app.schemas.user import FollowStatus, UserPublic, UserRead, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -142,4 +157,98 @@ def _username_conflict() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail="Username is already registered",
+    )
+
+
+@router.post(
+    "/{user_id}/follow",
+    response_model=FollowStatus,
+    status_code=status.HTTP_201_CREATED,
+)
+def follow_user(
+    user_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FollowStatus:
+    # The URL's {user_id} is parsed by FastAPI as a uuid.UUID and is the ONLY
+    # user ID the client ever controls. The follower comes exclusively from
+    # the JWT -> get_current_user() -> current_user.user_id. There is no
+    # request body, so a client cannot smuggle in a follower_id: if one is
+    # sent it is simply ignored.
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    if not target.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot follow an inactive user",
+        )
+
+    if user_id == current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot follow yourself",
+        )
+
+    # The follows table has a composite PRIMARY KEY (follower_id, followee_id),
+    # so a duplicate follow is structurally impossible at the DB level. This
+    # pre-check exists only to turn that constraint violation into a friendly
+    # 409 before we attempt the INSERT.
+    if db.get(Follow, (current_user.user_id, user_id)) is not None:
+        raise _already_following()
+
+    db.add(Follow(follower_id=current_user.user_id, followee_id=user_id))
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # Races a concurrent follow request that inserted the same row between
+        # our pre-check and the commit above.
+        db.rollback()
+        raise _already_following() from exc
+
+    return FollowStatus(is_following=True)
+
+
+@router.delete("/{user_id}/follow", response_model=FollowStatus)
+def unfollow_user(
+    user_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FollowStatus:
+    # Look up the relationship with our authenticated user as follower. There
+    # is nothing to "un-find" if the target user doesn't exist either — a
+    # follow row can't point at a nonexistent user (FK + ondelete CASCADE),
+    # so the 404 below covers "target missing" and "not following" alike.
+    follow = db.get(Follow, (current_user.user_id, user_id))
+    if follow is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="You are not following this user",
+        )
+
+    db.delete(follow)
+    db.commit()
+    return FollowStatus(is_following=False)
+
+
+@router.get("/{user_id}/follow-status", response_model=FollowStatus)
+def follow_status(
+    user_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FollowStatus:
+    # Simply whether a follows row (me -> them) exists. Deliberately no
+    # follower/following lists yet — that's a separate feature.
+    is_following = db.get(Follow, (current_user.user_id, user_id)) is not None
+    return FollowStatus(is_following=is_following)
+
+
+def _already_following() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="You are already following this user",
     )

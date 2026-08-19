@@ -94,3 +94,16 @@ class UserPublic(BaseModel):
     username: str
     profile_picture_url: str | None = None
     biography: str | None = None
+
+
+class FollowStatus(BaseModel):
+    """Response body for the follow endpoints.
+
+    `is_following` tells the authenticated caller whether they currently
+    follow the user named in the URL. It is the response for:
+      - POST   /users/{user_id}/follow       -> is_following: true
+      - DELETE /users/{user_id}/follow       -> is_following: false
+      - GET    /users/{user_id}/follow-status -> current state
+    """
+
+    is_following: bool
