@@ -44,3 +44,25 @@ def get_current_user(
         raise credentials_exception
 
     return user
+
+
+def get_current_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Admin gate. Every /admin/* endpoint depends on this, AFTER
+    get_current_user(), so the chain is exactly:
+
+        JWT -> get_current_user() -> 401 if bad
+                                   -> is_admin? -> 403 if not
+
+    'is_admin' comes from the users table — the JWT carries only the user
+    id, so there is nothing a client can put in a token to bypass this.
+    Normal authenticated users get HTTP 403 Forbidden; unauthenticated
+    (or bad-token) requests already got 401 from get_current_user().
+    """
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to perform administrative actions",
+        )
+    return current_user

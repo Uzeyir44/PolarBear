@@ -70,6 +70,12 @@ class User(Base):
     # history both depend on the user row still existing).
     is_active: Mapped[bool] = mapped_column(nullable=False, server_default=text("true"))
 
+    # Administration flag. True only for internal operators; gates every
+    # /admin/* endpoint through get_current_admin(). Promoted via SQL
+    # (UPDATE users SET is_admin = true WHERE ...) — never by the app, so
+    # there is no endpoint a normal user could call to self-promote.
+    is_admin: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), onupdate=text("now()"), nullable=False

@@ -44,6 +44,14 @@ venv/Scripts/uvicorn app.main:app --reload
 - Interactive API docs (Swagger UI): http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
 
+### Running the admin panel frontend
+
+```bash
+cd ../admin-frontend
+npm install      # first time only
+npm run dev      # http://localhost:5173 (proxies /auth and /admin to :8000)
+```
+
 ## Project structure
 
 ```
@@ -65,7 +73,11 @@ app/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
 │   ├── users.py          # /users/me, /users/me/coins, /users/me/transactions,
 │   │                     # PATCH /users/me, /users/search, follow/unfollow/follow-status
-│   └── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
+│   ├── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
+│   └── admin/            # Internal admin console (every route behind get_current_admin)
+│       ├── __init__.py   # /admin/me + mounts /admin/qr-codes and /admin/users
+│       ├── qr_codes.py   # /admin/qr-codes CRUD + status management, /admin/.../products
+│       └── users.py      # /admin/users list/detail/activate-deactivate
 tests/                   # End-to-end test scripts (run with python -m tests.<name>)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
@@ -75,8 +87,10 @@ tests/                   # End-to-end test scripts (run with python -m tests.<na
 ├── test_follow.py        # End-to-end follow/unfollow/follow-status checks
 ├── test_qr_redeem.py     # End-to-end POST /qr/redeem redeem checks
 ├── test_qr_redeem_coins.py# End-to-end coin-award checks (Step 3)
-└── test_user_coins.py    # End-to-end GET /users/me/coins and /users/me/transactions
-alembic/                  # Migrations (initial_schema)
+├── test_user_coins.py    # End-to-end GET /users/me/coins and /users/me/transactions
+├── test_admin_qr.py      # End-to-end admin auth + QR management checks
+└── test_admin_users.py   # End-to-end admin auth + user management checks
+alembic/                  # Migrations (initial_schema, users.is_admin flag)
 ```
 
 ## What's implemented so far
@@ -516,6 +530,15 @@ venv/Scripts/python -m tests.test_qr_redeem_coins
 # pagination, isolation between users, empty history, 401s, 422s,
 # field whitelist, QR/product reference surfaced from a real redemption)
 venv/Scripts/python -m tests.test_user_coins
+
+# Admin panel end-to-end (admin auth 401/403/granted, QR list/create/detail/
+# status management, invalid value/product/transition errors, product list)
+venv/Scripts/python -m tests.test_admin_qr
+
+# Admin user management end-to-end (401/403/granted, list ordering/pagination,
+# username+email search, is_active filter, detail 404s, deactivate/reactivate
+# incl. login enforcement + self-deactivation guard, no password leakage)
+venv/Scripts/python -m tests.test_admin_users
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -533,6 +556,70 @@ venv/Scripts/python -m tests.test_user_coins
 `test_qr_redeem_coins.py` verifies the coin award in depth: a valid redemption credits exactly `coin_value` coins and reports the correct new balance; the QR row becomes `REDEEMED`; exactly one `coin_transactions` row is created with the right `amount`, `balance_after`, `user_id`, `type_id` (`qr_redemption`), and `qr_id`; a second redemption correctly stacks onto the first (`balance_after` is the running total); redeeming the same code again → `409` with no second credit and still one ledger row; a mid-transaction failure (the `qr_redemption` type temporarily made unresolvable) rolls back the claim, the credit, and the ledger; and two concurrent attempts on the same code — both through two real DB connections and through concurrent HTTP calls — result in exactly one success and one `409`, with the coins awarded exactly once. All test data is cleaned up afterward.
 
 `test_user_coins.py` verifies the read side: missing/invalid/expired token → `401` on both endpoints; `GET /users/me/coins` returns the exact `coin_balance` from PostgreSQL; a client-supplied `user_id` query param is ignored; `GET /users/me/transactions` returns all of the user's rows in newest-first order with every row exposing only the whitelisted fields (`transaction_id`, `amount`, `balance_after`, `transaction_type`, `direction`, `created_at`, `qr`, and the nullable `competition_id`/`wardrobe_id`/`vote_id`); a real QR redemption surfaces with its QR code and product name; debit rows serialize as `direction: DEBIT` with negative amounts; `limit`/`offset` pagination tiles the full history with no overlap and empties beyond the end; another user's transactions are invisible (user B sees only B's rows) and balances are separate; empty history → `[]`; and invalid `limit`/`offset` (0, 51, -1, non-numeric, negative offset) → `422`. All test data is cleaned up afterward.
+
+`test_admin_qr.py` verifies the internal admin console: unauthenticated → `401` and normal users → `403` on every `/admin/*` endpoint; an administrator is granted access; `GET /admin/qr-codes` paginates newest-first with `total`/`limit`/`offset` and supports `status`/`product_id` filters; `GET /admin/qr-codes/{qr_id}` returns the product and (for redeemed codes) who redeemed it and when; `POST /admin/qr-codes` returns `201` with a generated unique `PB-` code that appears in the list, rejects a nonexistent product with `404` and non-positive coin values with `422`; `PATCH /admin/qr-codes/{qr_id}` allows ACTIVE ⇄ EXPIRED (deactivate/reactivate) but rejects ACTIVE → REDEEMED and any change to a REDEEMED code with `409` (audit trail), returning `404` for nonexistent codes; and a normal user's attempts — list, create, status change — are all denied with `403` and the rows are left untouched. The read-only product list for the create form (`GET /admin/qr-codes/products`) is covered too. All test data is cleaned up afterward.
+
+## Admin panel
+
+The internal administration console lives in two parts:
+
+- **Backend** — every route under `/admin/` in `app/routers/admin/`, protected by `get_current_admin()` (`app/dependencies.py`). The chain is always `JWT → get_current_user() → 401 if bad → is_admin? → 403 if not → endpoint`, so authorization is enforced by the server, not the browser.
+- **Frontend** — a small Vite + React app in `../admin-frontend/` (`npm run dev` on port 5173, proxying API calls to the backend on :8000).
+
+### Granting an administrator
+
+There is no "promote me" endpoint by design. Promote an operator directly in PostgreSQL (the app never sets `is_admin`):
+
+```sql
+UPDATE users SET is_admin = true WHERE username = '<your-admin-username>';
+```
+
+`users.is_admin` was added by the Alembic migration `7472ed35683a` (already applied when you ran `alembic upgrade head`).
+
+### Admin API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/admin/me` | Current administrator identity (sidebar header / access check) |
+| `GET` | `/admin/qr-codes` | Paginated QR list, newest first; `status` and `product_id` filters |
+| `POST` | `/admin/qr-codes` | Generate a new active QR code (`product_id`, `coin_value`, optional `expires_at`) |
+| `GET` | `/admin/qr-codes/{qr_id}` | Full administrative detail incl. redemptions |
+| `PATCH` | `/admin/qr-codes/{qr_id}` | Deactivate (`active → expired`) or reactivate (`expired → active`) |
+| `GET` | `/admin/qr-codes/products` | Read-only product choices for the create form |
+| `GET` | `/admin/users` | Paginated user list, newest first; `q` (username/email) search and `is_active` filter |
+| `GET` | `/admin/users/{user_id}` | Safe administrative detail for one user |
+| `PATCH` | `/admin/users/{user_id}/status` | Deactivate (`{"is_active": false}`) or reactivate a user |
+
+Status rules are enforced on the server: only `ACTIVE ⇄ EXPIRED` transitions are allowed; `REDEEMED` codes are immutable (they are audit history) and `ACTIVE → REDEEMED` is rejected with `409`. Users are never deleted — toggling `is_active` is the only administrative mutation, and an administrator cannot deactivate their own account (`400`).
+
+### Admin frontend
+
+Pages: `/login` (admin sign-in; an authenticated non-admin is refused), `/dashboard`, `/qr-codes` (list with filters, pagination, refresh, create modal, deactivate/reactivate with confirmation), `/qr-codes/:id` (details + status actions). A normal user's token never grants access — the UI hides nothing, the backend enforces everything.
+
+### Manual QR workflow test
+
+1. Start the backend and the admin frontend (commands below).
+2. Grant one of your users admin: `UPDATE users SET is_admin = true WHERE username = '<admin>';`
+3. Open http://localhost:5173 → log in as that administrator.
+4. Open **QR Codes** → view any existing codes (or none yet).
+5. Click **Create QR** → pick a product, enter a coin value → **Create** → the new `PB-…` code appears in the list.
+6. Open its **View** page → see code, product, coins, status, created/expiry.
+7. Use **Deactivate / Reactivate** and confirm in the dialog; reload to confirm the change stuck.
+8. Log out, log back in as a non-admin user → the panel refuses access (403 → redirect to login with the "not an administrator" message).
+
+### Manual user-management workflow test
+
+1. With the panel open as an administrator, click **Users** in the sidebar.
+2. See the user table (username, email, coins, streak, status, created).
+3. Type in the search box → the list narrows to matching usernames/emails.
+4. Filter by **Status** → Active / Inactive.
+5. Click **View** on any user → see profile picture/initials, biography, balances, and dates.
+6. Click **Deactivate** on that user (with confirmation) → the status flips to inactive, and the user's account is locked out of the app immediately (they can no longer log in).
+7. **Reactivate** → the status flips back to active and login is restored.
+8. Search yourself (the admin) → no **Deactivate** button appears; the backend also refuses self-deactivation with a 400.
+9. As a plain (non-admin) account, attempt to open `/users` in the browser → the panel redirects to login and every `/admin/users` API call returns 403.
+
+See `test_admin_users.py` for the automated coverage of all of the above.
 
 ## Test users
 
