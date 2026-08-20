@@ -2,7 +2,7 @@
 End-to-end check of POST /auth/register — FastAPI -> SQLAlchemy -> PostgreSQL.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_register
+    venv/Scripts/python -m tests.test_register
 
 Uses unique test user records and deletes them afterwards so the
 development database is left clean.

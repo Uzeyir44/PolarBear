@@ -2,7 +2,7 @@
 End-to-end check of login + JWT auth: register -> login -> /users/me.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_auth_flow
+    venv/Scripts/python -m tests.test_auth_flow
 
 Covers: successful login, JWT claims, protected /users/me, wrong password,
 nonexistent user, missing/invalid/expired token, inactive user. Test users

@@ -3,7 +3,7 @@ End-to-end check of POST /qr/redeem — Step 3: validate, mark redeemed,
 AND award coins.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_qr_redeem
+    venv/Scripts/python -m tests.test_qr_redeem
 
 Covers: valid active code -> 200 with the qr_codes row actually updated
 (status REDEEMED, redeemed_by_user_id = the caller, redeemed_at set) AND

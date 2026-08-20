@@ -3,7 +3,7 @@ End-to-end check of the follow feature — POST /users/{id}/follow,
 DELETE /users/{id}/follow, GET /users/{id}/follow-status.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_follow
+    venv/Scripts/python -m tests.test_follow
 
 Covers: valid follow, duplicate follow -> 409, self-follow -> 400,
 nonexistent target -> 404, inactive target -> 400, unfollow -> 200,

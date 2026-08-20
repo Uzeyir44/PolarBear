@@ -2,7 +2,7 @@
 End-to-end check of GET /users/search — authenticated partial username search.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_user_search
+    venv/Scripts/python -m tests.test_user_search
 
 Covers: partial (prefix and mid-string) match, case-insensitive match,
 no matches -> [], missing/invalid/expired token -> 401, empty/invalid

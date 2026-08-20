@@ -2,7 +2,7 @@
 Deep end-to-end checks of POST /qr/redeem — Step 3: award coins.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_qr_redeem_coins
+    venv/Scripts/python -m tests.test_qr_redeem_coins
 
 test_qr_redeem.py skims the coin side; this file verifies it in depth:
 

@@ -5,6 +5,12 @@ GET /me returns the profile of the currently authenticated user. It is the
 first endpoint protected by get_current_user() and serves as the pattern
 for every future endpoint that requires a logged-in user.
 
+GET /me/coins returns the authenticated user's current coin_balance.
+GET /me/transactions returns that user's coin_transactions ledger, newest
+first, with limit/offset pagination. Both paths are fixed (the caller is
+ALWAYS current_user.user_id from the JWT); neither endpoint accepts a
+user_id from the client, so a user can never read someone else's money.
+
 PATCH /me lets the authenticated user update their own profile. Only the
 whitelisted "profile" fields can change here — identity/accounting fields
 (user_id, email, password_hash, coin_balance, winning_streak, is_active,
@@ -54,11 +60,12 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import Follow, User
+from app.models import CoinTransaction, Follow, QRCode, User
+from app.schemas.coin import CoinBalance, CoinTransactionRead, QRTransactionReference
 from app.schemas.user import FollowStatus, UserPublic, UserRead, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -67,6 +74,77 @@ router = APIRouter(prefix="/users", tags=["users"])
 @router.get("/me", response_model=UserRead)
 def read_current_user(current_user: User = Depends(get_current_user)) -> User:
     return current_user
+
+
+@router.get("/me/coins", response_model=CoinBalance)
+def get_my_coins(current_user: User = Depends(get_current_user)) -> CoinBalance:
+    # current_user was already loaded by get_current_user() in this request's
+    # session, so there is no extra query and no user_id is ever read from the
+    # client. We only ever return the authenticated user's own balance.
+    return CoinBalance(balance=current_user.coin_balance)
+
+
+@router.get("/me/transactions", response_model=list[CoinTransactionRead])
+def get_my_transactions(
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=50,
+        description="How many transactions to return (1-50)",
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="How many transactions to skip before returning results",
+    ),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[CoinTransactionRead]:
+    # user_id comes ONLY from the JWT -> get_current_user() ->
+    # current_user.user_id; there is no user_id query/body path parameter.
+    # The (user_id, created_at) composite index serves exactly this
+    # WHERE user_id = ? + ORDER BY created_at pattern (a backward index
+    # scan), so the DB does not sort the user's whole history.
+    rows = db.execute(
+        select(CoinTransaction)
+        .where(CoinTransaction.user_id == current_user.user_id)
+        .options(
+            selectinload(CoinTransaction.type),
+            selectinload(CoinTransaction.qr_code).joinedload(QRCode.product),
+        )
+        .order_by(CoinTransaction.created_at.desc(), CoinTransaction.transaction_id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).scalars().all()
+
+    return [_to_transaction_read(tx) for tx in rows]
+
+
+def _to_transaction_read(tx: CoinTransaction) -> CoinTransactionRead:
+    qr_ref = (
+        QRTransactionReference(
+            qr_id=tx.qr_code.qr_id,
+            code=tx.qr_code.code,
+            product_name=tx.qr_code.product.name,
+        )
+        if tx.qr_code is not None
+        else None
+    )
+    return CoinTransactionRead(
+        transaction_id=tx.transaction_id,
+        amount=tx.amount,
+        balance_after=tx.balance_after,
+        # type_name "qr_redemption" / "refund" / ... ; direction's .name is
+        # the DB-stored value ("CREDIT"/"DEBIT"), not the enum's lowercase
+        # .value, so the API exposes exactly what the lookup table holds.
+        transaction_type=tx.type.type_name,
+        direction=tx.type.direction.name,
+        created_at=tx.created_at,
+        qr=qr_ref,
+        competition_id=tx.competition_id,
+        wardrobe_id=tx.wardrobe_id,
+        vote_id=tx.vote_id,
+    )
 
 
 @router.get("/search", response_model=list[UserPublic])

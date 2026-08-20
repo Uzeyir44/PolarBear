@@ -59,18 +59,23 @@ app/
 ├── schemas/
 │   ├── user.py           # UserRegister/UserUpdate (input), UserRead/UserPublic (output)
 │   ├── token.py          # LoginRequest (input), Token (output)
-│   └── qr.py             # QRCodeRedeemRequest (input), QRCodeRedemptionResult (output)
+│   ├── qr.py             # QRCodeRedeemRequest (input), QRCodeRedemptionResult (output)
+│   └── coin.py           # CoinBalance / CoinTransactionRead / QRTransactionReference (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
-│   ├── users.py          # /users/me, PATCH /users/me, /users/search, follow/unfollow/follow-status (protected)
+│   ├── users.py          # /users/me, /users/me/coins, /users/me/transactions,
+│   │                     # PATCH /users/me, /users/search, follow/unfollow/follow-status
 │   └── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
+tests/                   # End-to-end test scripts (run with python -m tests.<name>)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
 ├── test_auth_flow.py     # End-to-end login + JWT checks
 ├── test_update_profile.py# End-to-end PATCH /users/me checks
 ├── test_user_search.py   # End-to-end GET /users/search checks
 ├── test_follow.py        # End-to-end follow/unfollow/follow-status checks
-└── test_qr_redeem.py     # End-to-end POST /qr/redeem redeem checks
+├── test_qr_redeem.py     # End-to-end POST /qr/redeem redeem checks
+├── test_qr_redeem_coins.py# End-to-end coin-award checks (Step 3)
+└── test_user_coins.py    # End-to-end GET /users/me/coins and /users/me/transactions
 alembic/                  # Migrations (initial_schema)
 ```
 
@@ -396,6 +401,74 @@ The user's `coin_balance` is bumped with one atomic `coin_balance = coin_balance
 
 The `qr_codes` timestamp columns are `timestamp without time zone` (timezone-naive). `redeemed_at` is written as naive UTC and all stored timestamps are treated as UTC when compared. Keep that convention when admin code creation is implemented.
 
+## Coin balance & transaction history
+
+Two read-only endpoints let the authenticated user see their own coins. Both are read-only — nothing here changes the balance or the ledger — and both derive the user **only** from the JWT:
+
+```
+Authorization: Bearer <JWT>
+   ↓
+get_current_user()
+   ↓
+current_user.user_id
+```
+
+Neither endpoint accepts a `user_id` from the client (no path/query/body parameter), so one user can never read another user's money.
+
+### Current balance (`GET /users/me/coins`)
+
+Returns the cached `coin_balance` already loaded by `get_current_user()` (`users.coin_balance` is a cache of the ledger; the ledger rows are the source of truth). No extra query, no writes.
+
+Response (`200 OK`):
+
+```json
+{ "balance": 150 }
+```
+
+### Transaction history (`GET /users/me/transactions`)
+
+Returns the authenticated user's `coin_transactions` ledger rows, newest first, paginated with `limit` (default 20, valid 1–50) and `offset` (default 0):
+
+```
+GET /users/me/transactions?limit=20&offset=0
+Authorization: Bearer <JWT>
+```
+
+- Newest transactions appear first (`ORDER BY created_at DESC`, tie-broken by `transaction_id`).
+- The query filters `WHERE user_id = current_user.user_id` and the existing `ix_coin_transactions_user_id_created_at (user_id, created_at)` composite index serves exactly this filter-plus-sort pattern (a backward index scan), so the database never sorts the user's whole history.
+- `limit`/`offset` are validated by FastAPI (`ge`/`le`) → invalid values are `422`.
+- An empty history returns `200` with `[]`.
+
+Each item resolves the ledger's internal ids into something the client can use. `transaction_type` and `direction` come from the joined `coin_transaction_types` lookup row; when the transaction was a QR redemption, the `qr` object carries the scanned code and its product. Reference fields for not-yet-implemented features (competition/wardrobe/vote) are nullable and currently null. Internal fields (`user_id`, `type_id`, raw relationship objects) are never exposed.
+
+Response (`200 OK`) — `transaction_type`/`direction`/`qr` populated because this row came from redeeming a QR code:
+
+```json
+[
+  {
+    "transaction_id": "e1b49c0a-…",
+    "amount": 30,
+    "balance_after": 130,
+    "transaction_type": "qr_redemption",
+    "direction": "CREDIT",
+    "created_at": "2026-08-20T08:46:57.966818",
+    "qr": {
+      "qr_id": "fad47fec-…",
+      "code": "COLA-ABC123",
+      "product_name": "Cola 330ml"
+    },
+    "competition_id": null,
+    "wardrobe_id": null,
+    "vote_id": null
+  }
+]
+```
+
+### Security notes
+
+- The response schemas (`CoinBalance`, `CoinTransactionRead`, `QRTransactionReference` in `app/schemas/coin.py`) are output-only — they define exactly which fields can appear, so a leaked internal column would be dropped by FastAPI's `response_model` filtering even if it were ever returned.
+- The query always filters by `current_user.user_id`; there is no code path that reads another user's rows.
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -412,32 +485,37 @@ Hand-written scripts (no framework) that exercise the real HTTP + DB stack. Run 
 
 ```bash
 # DB connectivity
-venv/Scripts/python -m app.test_db
+venv/Scripts/python -m tests.test_db
 
 # Registration end-to-end (creates unique test users, then deletes them)
-venv/Scripts/python -m app.test_register
+venv/Scripts/python -m tests.test_register
 
 # Login + JWT end-to-end (register -> login -> /users/me, plus 401 cases)
-venv/Scripts/python -m app.test_auth_flow
+venv/Scripts/python -m tests.test_auth_flow
 
 # PATCH /users/me end-to-end (single/multi-field update, duplicates, 401s, 422s)
-venv/Scripts/python -m app.test_update_profile
+venv/Scripts/python -m tests.test_update_profile
 
 # GET /users/search end-to-end (partial/case-insensitive match, 401s, 422s,
 # self-exclusion, inactive users, public-field-only responses)
-venv/Scripts/python -m app.test_user_search
+venv/Scripts/python -m tests.test_user_search
 
 # Follow/unfollow end-to-end (valid follow, duplicates, self-follow, 404s,
 # 400s, 401s, follow-status, body-supplied follower_id ignored)
-venv/Scripts/python -m app.test_follow
+venv/Scripts/python -m tests.test_follow
 
 # QR redemption end-to-end (valid/redeemed/expired/overdue codes, 404s,
 # 401s, response field whitelist, DB row updated, coins awarded + ledger row)
-venv/Scripts/python -m app.test_qr_redeem
+venv/Scripts/python -m tests.test_qr_redeem
 
 # QR redemption coin award (deep: correct coins, ledger row, balance_after,
 # qr_id reference, no double award, failed-transaction rollback, concurrency)
-venv/Scripts/python -m app.test_qr_redeem_coins
+venv/Scripts/python -m tests.test_qr_redeem_coins
+
+# Coin balance + history end-to-end (balance matches DB, ordering,
+# pagination, isolation between users, empty history, 401s, 422s,
+# field whitelist, QR/product reference surfaced from a real redemption)
+venv/Scripts/python -m tests.test_user_coins
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -453,6 +531,8 @@ venv/Scripts/python -m app.test_qr_redeem_coins
 `test_qr_redeem.py` verifies: missing/invalid/expired token → `401`, nonexistent code → `404`, already-redeemed code → `409`, expired code → `410`, active-but-past-`expires_at` code → `410`, valid active code → `200` with `message`/`coins_earned`/`balance` **and** the row actually updated in the DB (status `REDEEMED`, `redeemed_by_user_id` = caller, `redeemed_at` set), the user's `coin_balance` increased by `coin_value` with exactly one `coin_transactions` row, the response exposes **only** those three safe fields, and the same code can't be redeemed again by the same or a different user → `409` with the original owner preserved. Test products, qr_codes, users, and their coin transactions are cleaned up afterward.
 
 `test_qr_redeem_coins.py` verifies the coin award in depth: a valid redemption credits exactly `coin_value` coins and reports the correct new balance; the QR row becomes `REDEEMED`; exactly one `coin_transactions` row is created with the right `amount`, `balance_after`, `user_id`, `type_id` (`qr_redemption`), and `qr_id`; a second redemption correctly stacks onto the first (`balance_after` is the running total); redeeming the same code again → `409` with no second credit and still one ledger row; a mid-transaction failure (the `qr_redemption` type temporarily made unresolvable) rolls back the claim, the credit, and the ledger; and two concurrent attempts on the same code — both through two real DB connections and through concurrent HTTP calls — result in exactly one success and one `409`, with the coins awarded exactly once. All test data is cleaned up afterward.
+
+`test_user_coins.py` verifies the read side: missing/invalid/expired token → `401` on both endpoints; `GET /users/me/coins` returns the exact `coin_balance` from PostgreSQL; a client-supplied `user_id` query param is ignored; `GET /users/me/transactions` returns all of the user's rows in newest-first order with every row exposing only the whitelisted fields (`transaction_id`, `amount`, `balance_after`, `transaction_type`, `direction`, `created_at`, `qr`, and the nullable `competition_id`/`wardrobe_id`/`vote_id`); a real QR redemption surfaces with its QR code and product name; debit rows serialize as `direction: DEBIT` with negative amounts; `limit`/`offset` pagination tiles the full history with no overlap and empties beyond the end; another user's transactions are invisible (user B sees only B's rows) and balances are separate; empty history → `[]`; and invalid `limit`/`offset` (0, 51, -1, non-numeric, negative offset) → `422`. All test data is cleaned up afterward.
 
 ## Test users
 

@@ -2,7 +2,7 @@
 End-to-end check of PATCH /users/me — profile update for the logged-in user.
 
 Run from the backend/ directory:
-    venv/Scripts/python -m app.test_update_profile
+    venv/Scripts/python -m tests.test_update_profile
 
 Covers: single-field updates leave other fields unchanged, multi-field
 update, clearing a field with null, duplicate username 409 (including
