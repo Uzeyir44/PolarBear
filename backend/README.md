@@ -63,7 +63,7 @@ app/
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
 │   ├── users.py          # /users/me, PATCH /users/me, /users/search, follow/unfollow/follow-status (protected)
-│   └── qr.py             # POST /qr/redeem — Step 2: validate + redeem (protected)
+│   └── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
 ├── test_auth_flow.py     # End-to-end login + JWT checks
@@ -344,9 +344,9 @@ Two layers:
 1. **Database level (the real guarantee):** the `follows` table's composite primary key on `(follower_id, followee_id)` makes a second identical follow structurally impossible — the INSERT would violate the PK.
 2. **Application level (the friendly error):** the endpoint pre-checks the same tuple with `db.get(Follow, ...)` and returns `409 Conflict` instead of letting the raw constraint error surface. The `IntegrityError` fallback covers the race where two concurrent requests pass the pre-check before either commits.
 
-## QR code redemption — Step 2: validate AND redeem a code
+## QR code redemption — Step 3: validate, redeem, and award coins
 
-Redemption in one step: `POST /qr/redeem` first validates the submitted code (exists, `ACTIVE`, not expired), then **claims it for the authenticated user** — `status = REDEEMED`, `redeemed_by_user_id = <caller>`, `redeemed_at = now` — and commits. Coins are **not** awarded yet (that is Step 3).
+Redemption end to end: `POST /qr/redeem` validates the submitted code (exists, `ACTIVE`, not expired), **claims it for the authenticated user** (`status = REDEEMED`, `redeemed_by_user_id = <caller>`, `redeemed_at = now`), **credits the user's coins**, and writes the matching `coin_transactions` ledger row — all in **one database transaction** that commits (or rolls back) as a unit.
 
 ### Redeem a code (`POST /qr/redeem`)
 
@@ -359,42 +359,38 @@ Requires `Authorization: Bearer <token>`. Request body (`QRCodeRedeemRequest`):
 Flow:
 1. Authenticate via `get_current_user()`; no/invalid/expired token → `401`.
 2. Pydantic validates `code` (1–64 chars) → `422` on bad input.
-3. Look up the row with `select(QRCode).where(QRCode.code == ...)`; unknown code → `404`.
-4. Status `REDEEMED` → `409 Conflict` ("Code has already been redeemed") — no DB changes.
-5. Status `EXPIRED`, **or** an `ACTIVE` code whose `expires_at` has passed → `410 Gone` ("Code has expired").
-6. Otherwise, update the row (see "SQLAlchemy transaction/commit behavior" below) and commit.
-7. Reload the row and return a simple success response.
+3. Lock the row with `select(QRCode).where(QRCode.code == ...).with_for_update()` (`SELECT … FOR UPDATE`); unknown code → `404`.
+4. While holding the lock, check status: `REDEEMED` → `409 Conflict` ("Code has already been redeemed"); `EXPIRED`, **or** an `ACTIVE` code whose `expires_at` has passed → `410 Gone` ("Code has expired").
+5. Mark the code `REDEEMED`, set `redeemed_by_user_id`/`redeemed_at`.
+6. Credit the user with a single atomic `UPDATE users SET coin_balance = coin_balance + <coin_value> RETURNING coin_balance`.
+7. Look up the `qr_redemption` type from `coin_transaction_types` and insert the ledger row (`user_id`, `type_id`, `amount = coin_value`, `balance_after = new balance`, `qr_id`).
+8. `db.commit()` — the claim, credit, and ledger insert all become permanent together. (If any of those steps raised instead, nothing commits and the session close rolls the whole transaction back.)
+9. Return a response exposing only the message, the coins earned, and the new balance.
 
-Response (`200 OK`) — exposes only the message, the QR id, and the redemption timestamp:
+Response (`200 OK`) — exposes only `message`, `coins_earned`, `balance`:
 
 ```json
 {
   "message": "Code redeemed successfully",
-  "qr_id": "7f6c5e6a-…",
-  "redeemed_at": "2026-08-19T09:46:50.736303"
+  "coins_earned": 10,
+  "balance": 150
 }
 ```
 
-Internal fields (`product_id`, `coin_value`, `status`, `redeemed_by_user_id`, `expires_at`, `created_at`) are **not** returned.
+Internal fields (`qr_id`, `product_id`, `coin_value`, `status`, `redeemed_by_user_id`, `redeemed_at`, `expires_at`, `created_at`) are **not** returned.
 
-### Double-redemption protection
+### Why one transaction + row locking
 
-A code must never be redeemed twice. Two layers:
+The claim, the balance credit, and the ledger insert are deliberately committed **together**. On a failure anywhere in between, both of these impossible states are prevented: "QR redeemed but user got no coins" and "user got coins but no ledger row". Because `get_db()` closes the session in a `finally` block, an exception before `commit()` rolls the whole transaction back.
 
-1. **Application pre-check** — if the loaded row is already `REDEEMED`, return `409` before writing anything. This handles the normal sequential case.
-2. **Atomic claim** — the actual update runs as `UPDATE qr_codes SET … WHERE qr_id = … AND status = 'ACTIVE'`. Postgres locks the row at UPDATE time, so if two requests race, only the first UPDATE matches a row. The second gets `rowcount == 0` → we rollback and return `409`. A plain "check then update" would let both concurrent requests pass and double-redeem; the `WHERE status = 'ACTIVE'` guard closes that gap.
+A code must be redeemable exactly once, and a naive "load the row, check `status == 'ACTIVE'` in Python, then write" can race: two requests can both read `active`, both pass the check, and both award coins. The endpoint therefore takes an exclusive **row lock** with `SELECT … FOR UPDATE` **before** checking the status. Postgres holds that lock until the transaction ends, so the two requests serialize: the first locks the row, redeems, and commits; the second blocks on the lock, then re-reads the now-`REDEEMED` row and returns `409`. The Python status check is only reliable *because* it happens under the lock.
 
-### SQLAlchemy transaction/commit behavior
-
-- The session (from `get_db()`) wraps the whole request in a transaction. `db.commit()` makes the UPDATE permanent; without it the change would be rolled back when the session closes.
-- The update is issued with SQLAlchemy's `update()` construct (a Core statement) rather than plain ORM attribute assignment, so it can carry the `WHERE status = 'ACTIVE'` atomicity guard. `db.execute(update(...))` returns a result with a `rowcount` we use to detect the lost race.
-- Because a Core UPDATE does **not** refresh ORM objects automatically, the endpoint calls `db.refresh(qr)` after the commit so the returned `redeemed_at` reflects the row as it actually exists in the database.
-- On a detected race (`rowcount == 0`), `db.rollback()` discards the empty transaction before raising `409`.
+The user's `coin_balance` is bumped with one atomic `coin_balance = coin_balance + n` statement rather than `user.coin_balance += n` in Python. That prevents a *lost update* when the **same user** redeems two **different** codes concurrently — a read-modify-write would let the second request overwrite the first request's credit using a stale value.
 
 ### What this step does NOT do (deliberately)
 
-- It does **not** modify `coin_balance`, create a `coin_transaction`, or award coins — that is Step 3.
 - It does **not** generate QR/barcodes or provide admin code creation.
+- It does **not** implement clothing purchases, voting, or competition rewards.
 
 ### Timezone note
 
@@ -436,8 +432,12 @@ venv/Scripts/python -m app.test_user_search
 venv/Scripts/python -m app.test_follow
 
 # QR redemption end-to-end (valid/redeemed/expired/overdue codes, 404s,
-# 401s, response field whitelist, DB row updated, no coin changes)
+# 401s, response field whitelist, DB row updated, coins awarded + ledger row)
 venv/Scripts/python -m app.test_qr_redeem
+
+# QR redemption coin award (deep: correct coins, ledger row, balance_after,
+# qr_id reference, no double award, failed-transaction rollback, concurrency)
+venv/Scripts/python -m app.test_qr_redeem_coins
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -450,7 +450,9 @@ venv/Scripts/python -m app.test_qr_redeem
 
 `test_follow.py` verifies: missing/invalid/expired token → `401`, follow nonexistent user → `404`, follow inactive user → `400`, follow yourself → `400`, valid follow → `201` with the row actually in the DB, duplicate follow → `409` with no duplicate row, a body-supplied `follower_id` is ignored (the follower always comes from the JWT), follow-status returns `is_following: true`/`false`, unfollow someone not followed → `404`, valid unfollow → `200` with the row actually deleted, unfollow again → `404`, and a second user can follow the same target. All test users (and their follow rows, via cascade) are cleaned up afterward.
 
-`test_qr_redeem.py` verifies: missing/invalid/expired token → `401`, nonexistent code → `404`, already-redeemed code → `409`, expired code → `410`, active-but-past-`expires_at` code → `410`, valid active code → `200` with `message`/`qr_id`/`redeemed_at` **and** the row actually updated in the DB (status `REDEEMED`, `redeemed_by_user_id` = caller, `redeemed_at` set), the response exposes **only** those three safe fields, the same code can't be redeemed again by the same or a different user → `409` with the original owner preserved, and redemption never touches `coin_balance` or `coin_transactions`. Test products, qr_codes, and users are cleaned up afterward.
+`test_qr_redeem.py` verifies: missing/invalid/expired token → `401`, nonexistent code → `404`, already-redeemed code → `409`, expired code → `410`, active-but-past-`expires_at` code → `410`, valid active code → `200` with `message`/`coins_earned`/`balance` **and** the row actually updated in the DB (status `REDEEMED`, `redeemed_by_user_id` = caller, `redeemed_at` set), the user's `coin_balance` increased by `coin_value` with exactly one `coin_transactions` row, the response exposes **only** those three safe fields, and the same code can't be redeemed again by the same or a different user → `409` with the original owner preserved. Test products, qr_codes, users, and their coin transactions are cleaned up afterward.
+
+`test_qr_redeem_coins.py` verifies the coin award in depth: a valid redemption credits exactly `coin_value` coins and reports the correct new balance; the QR row becomes `REDEEMED`; exactly one `coin_transactions` row is created with the right `amount`, `balance_after`, `user_id`, `type_id` (`qr_redemption`), and `qr_id`; a second redemption correctly stacks onto the first (`balance_after` is the running total); redeeming the same code again → `409` with no second credit and still one ledger row; a mid-transaction failure (the `qr_redemption` type temporarily made unresolvable) rolls back the claim, the credit, and the ledger; and two concurrent attempts on the same code — both through two real DB connections and through concurrent HTTP calls — result in exactly one success and one `409`, with the coins awarded exactly once. All test data is cleaned up afterward.
 
 ## Test users
 
@@ -506,7 +508,7 @@ Verify directly in the database:
 SELECT * FROM follows;
 ```
 
-### QR redemption (Step 2 — validate + redeem)
+### QR redemption (Step 3 — validate, redeem, award coins)
 
 There is no admin endpoint to create QR codes yet, so seed test data directly in the DB (or via psql):
 
@@ -540,7 +542,7 @@ Then in Postman (log in as **alice** from the Test users table and use her token
 
 | Request | Expected |
 | --- | --- |
-| `POST /qr/redeem` `{"code": "COLA-MANUAL-VALID"}` | `200` `{"message": "Code redeemed successfully", "qr_id": "...", "redeemed_at": "..."}` |
+| `POST /qr/redeem` `{"code": "COLA-MANUAL-VALID"}` | `200` `{"message": "Code redeemed successfully", "coins_earned": 10, "balance": <alice's balance + 10>}` |
 | `POST /qr/redeem` `{"code": "COLA-MANUAL-VALID"}` again | `409` |
 | `POST /qr/redeem` `{"code": "COLA-MANUAL-REDEEMED"}` | `409` |
 | `POST /qr/redeem` `{"code": "COLA-MANUAL-EXPIRED"}` | `410` |
@@ -555,4 +557,12 @@ Confirm the code is now redeemed in the database (and that alice is the owner):
 SELECT code, status, redeemed_by_user_id, redeemed_at
 FROM qr_codes
 WHERE code = 'COLA-MANUAL-VALID';  -- status = REDEEMED, redeemed_by = alice's id, redeemed_at set
+```
+
+And that alice was credited exactly once:
+
+```sql
+SELECT amount, balance_after, qr_id
+FROM coin_transactions
+WHERE user_id = '<alice_user_id>';  -- one row per redeemed code, amount = coin_value
 ```

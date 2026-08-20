@@ -1,29 +1,43 @@
 """
-QR code redemption — Step 2: validate a code AND mark it redeemed.
+QR code redemption — Step 3: validate, redeem, AND award coins.
 
-POST /qr/redeem now does the full first half of redemption in one shot:
+POST /qr/redeem now does the whole flow in ONE database transaction:
 
-  Step 1: find the code, check it exists, is ACTIVE, and is not expired.
-  Step 2: atomically claim it — status = REDEEMED, redeemed_by_user_id =
-          the authenticated user, redeemed_at = now. Committed immediately.
+  Step 1: lock the code's row (SELECT ... FOR UPDATE) and validate that it
+          exists, is ACTIVE, and is not expired.
+  Step 2: claim it — status = REDEEMED, redeemed_by_user_id = the
+          authenticated user, redeemed_at = now.
+  Step 3: credit the user — coin_balance += coin_value, and insert the
+          matching coin_transactions ledger row (type = qr_redemption,
+          amount = coin_value, balance_after = the new balance, qr_id set).
 
-Coins are deliberately NOT awarded here: no coin_balance change, no
-coin_transaction row. That is the next step.
+The three writes are committed together at the end. If anything between the
+lock and the commit raises, nothing is committed: get_db() closes the
+session, which rolls the whole transaction back. We can never end up with
+"QR redeemed but coins not credited" or "coins credited but no ledger row".
 
-Double-redemption protection (two layers):
-  1. Application pre-check: if the row we loaded is already REDEEMED we
-     return 409 before writing anything.
-  2. Atomic UPDATE ... WHERE status = 'active': this guard closes the race
-     where two concurrent requests both pass the pre-check before either
-     commits. Postgres locks the row at UPDATE-time; the second UPDATE
-     matches zero rows (rowcount == 0) and we return 409. Without this a
-     single code could be redeemed twice under concurrency.
+Why SELECT ... FOR UPDATE?
+A code must be redeemable exactly once, and a naive "load row, check status
+in Python, write" can race: two requests can both read status = 'active',
+both pass the check, and both award coins. By locking the row with
+`SELECT ... FOR UPDATE` we serialize the requests — the first to lock the row
+commits its redemption, and the second blocks until the first finishes, then
+sees status = 'redeemed' and returns 409. Postgres holds row locks until the
+transaction ends (commit OR rollback), which is why the lock covers the
+status re-check, the balance update, and the ledger insert.
+
+Why the atomic balance UPDATE?
+`coin_balance` is updated with a single
+`UPDATE users SET coin_balance = coin_balance + :n RETURNING coin_balance`
+rather than read-modify-write in Python. That stops a lost update when the
+SAME user redeems two DIFFERENT codes concurrently — a Python-side
+`user.coin_balance += n` would let the second request overwrite the first
+request's credit using a stale value read before either committed.
 
 Expiration semantics: a code is invalid if its status is EXPIRED, or if
 expires_at is set and has already passed. The DB stores timestamps as
 `timestamp without time zone` (timezone-naive). redeemed_at is written as
-naive UTC to match that convention (see Step-1 notes); treat all stored
-timestamps as UTC.
+naive UTC to match that convention; treat all stored timestamps as UTC.
 """
 from datetime import datetime, timezone
 
@@ -33,10 +47,13 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import QRCode, QRStatus, User
+from app.models import QRCode, QRStatus, CoinTransaction, CoinTransactionType, User
 from app.schemas.qr import QRCodeRedeemRequest, QRCodeRedemptionResult
 
 router = APIRouter(prefix="/qr", tags=["qr"])
+
+# type_name of the seeded lookup row in coin_transaction_types.
+QR_REDEMPTION_TYPE_NAME = "qr_redemption"
 
 
 @router.post("/redeem", response_model=QRCodeRedemptionResult)
@@ -45,8 +62,15 @@ def redeem_code(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> QRCodeRedemptionResult:
+    return _redeem_qr(db, payload.code, current_user)
+
+
+def _redeem_qr(db: Session, code: str, user: User) -> QRCodeRedemptionResult:
+    # SELECT ... FOR UPDATE takes an exclusive row lock on the qr_codes row.
+    # A concurrent redemption of the same code blocks here until this
+    # transaction commits or rolls back, then re-reads the committed row.
     qr = db.execute(
-        select(QRCode).where(QRCode.code == payload.code)
+        select(QRCode).where(QRCode.code == code).with_for_update()
     ).scalar_one_or_none()
 
     if qr is None:
@@ -55,46 +79,68 @@ def redeem_code(
             detail="Code not found",
         )
 
-    # Friendly pre-checks so a clearly unusable code fails before any write.
+    # We hold the row lock now, so this status check is authoritative: nobody
+    # can flip the row between this check and our commit. The lock (not the
+    # Python check) is what makes it safe under concurrency.
     if qr.status == QRStatus.REDEEMED:
         raise _already_redeemed()
 
-    # EXPIRED status OR an ACTIVE code whose expires_at has passed.
     if qr.status == QRStatus.EXPIRED or _is_expired(qr):
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Code has expired",
         )
 
-    # Claim the code atomically. The `WHERE status = 'active'` is the real
-    # anti-double-redeem guard: a concurrent request that already flipped
-    # this row to REDEEMED will match zero rows here.
+    # --- One atomic transaction: claim the QR, credit coins, write the ledger.
     redeemed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    result = db.execute(
-        update(QRCode)
-        .where(QRCode.qr_id == qr.qr_id, QRCode.status == QRStatus.ACTIVE)
-        .values(
-            status=QRStatus.REDEEMED,
-            redeemed_by_user_id=current_user.user_id,
-            redeemed_at=redeemed_at,
+    qr.status = QRStatus.REDEEMED
+    qr.redeemed_by_user_id = user.user_id
+    qr.redeemed_at = redeemed_at
+
+    # Atomic increment; RETURNING gives the authoritative new balance for both
+    # the ledger row and the response (see module docstring).
+    new_balance = db.execute(
+        update(User)
+        .where(User.user_id == user.user_id)
+        .values(coin_balance=User.coin_balance + qr.coin_value)
+        .returning(User.coin_balance)
+    ).scalar_one()
+
+    coins_earned = qr.coin_value
+
+    # Seeded by the initial migration; resolved HERE (after the writes above)
+    # so that a missing row exercises this endpoint's own rollback path: the
+    # claim and the credit are already staged, and the rollback undoes both.
+    qr_type_id = db.execute(
+        select(CoinTransactionType.type_id).where(
+            CoinTransactionType.type_name == QR_REDEMPTION_TYPE_NAME
+        )
+    ).scalar_one_or_none()
+    if qr_type_id is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="QR redemption transaction type is not configured",
+        )
+
+    db.add(
+        CoinTransaction(
+            user_id=user.user_id,
+            type_id=qr_type_id,
+            amount=coins_earned,
+            balance_after=new_balance,
+            qr_id=qr.qr_id,
         )
     )
 
-    if result.rowcount == 0:
-        # Lost the race — someone else redeemed it between our pre-check and
-        # the UPDATE. Discard the (empty) transaction and report 409.
-        db.rollback()
-        raise _already_redeemed()
-
+    # One commit for all three writes. If anything above raised, no commit
+    # happens and the whole transaction rolls back when the session closes.
     db.commit()
-    # Reload the row so the response reflects what is actually in the DB
-    # (the Core UPDATE above doesn't refresh the ORM object by itself).
-    db.refresh(qr)
 
     return QRCodeRedemptionResult(
         message="Code redeemed successfully",
-        qr_id=qr.qr_id,
-        redeemed_at=qr.redeemed_at,
+        coins_earned=coins_earned,
+        balance=new_balance,
     )
 
 

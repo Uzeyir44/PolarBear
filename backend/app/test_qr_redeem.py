@@ -1,17 +1,23 @@
 """
-End-to-end check of POST /qr/redeem — Step 2: validate AND mark redeemed.
+End-to-end check of POST /qr/redeem — Step 3: validate, mark redeemed,
+AND award coins.
 
 Run from the backend/ directory:
     venv/Scripts/python -m app.test_qr_redeem
 
-Covers: valid active code -> 200 and the qr_codes row is actually updated
-(status REDEEMED, redeemed_by_user_id = the caller, redeemed_at set),
-the same code cannot be redeemed again by anyone -> 409, nonexistent code
--> 404, redeemed code -> 409, expired code -> 410, active-but-past-
-expires_at -> 410, missing/invalid/expired token -> 401, the response
-exposes only message/qr_id/redeemed_at, and redemption NEVER touches
-coin_balance or coin_transactions (that's the next step). Test products,
-qr_codes, and users are deleted afterwards so the dev DB is left clean.
+Covers: valid active code -> 200 with the qr_codes row actually updated
+(status REDEEMED, redeemed_by_user_id = the caller, redeemed_at set) AND
+the caller's coin_balance increased by coin_value with a matching
+coin_transactions ledger row, the same code cannot be redeemed again by
+anyone -> 409, nonexistent code -> 404, redeemed code -> 409, expired code
+-> 410, active-but-past-expires_at -> 410, missing/invalid/expired token
+-> 401, and the response exposes only message/coins_earned/balance.
+
+The deep checks on the award (balance_after, qr_id reference, double
+redemption, rollback, concurrency) live in test_qr_redeem_coins.py.
+
+Test products, qr_codes, users, and their coin_transactions are deleted
+afterwards so the dev DB is left clean.
 """
 import time
 import uuid
@@ -30,7 +36,7 @@ from sqlalchemy import select, text
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.main import app
-from app.models import QRCode, QRStatus, Product, User
+from app.models import QRCode, QRStatus, CoinTransaction, Product, User
 
 client = TestClient(app)
 
@@ -58,7 +64,17 @@ def report(name: str, ok: bool, extra: str = "") -> None:
 
 def cleanup() -> None:
     with SessionLocal() as db:
-        # Delete qr codes first: both product_id and redeemed_by_user_id are
+        # coin_transactions FKs (user_id, qr_id) are RESTRICT, so ledger rows
+        # must go before the qr_codes and users they reference.
+        for username in (USERNAME, USERNAME_2):
+            user = db.execute(select(User).where(User.username == username)).scalar_one_or_none()
+            if user is not None:
+                for tx in db.execute(
+                    select(CoinTransaction).where(CoinTransaction.user_id == user.user_id)
+                ).scalars().all():
+                    db.delete(tx)
+        db.commit()
+        # Delete qr codes: both product_id and redeemed_by_user_id are
         # RESTRICT FKs, so children must go before their parents.
         for code in created_codes:
             qr = db.execute(select(QRCode).where(QRCode.code == code)).scalar_one_or_none()
@@ -135,12 +151,9 @@ token = response.json().get("access_token", "")
 AUTH = {"Authorization": f"Bearer {token}"}
 results.append(("setup login works", bool(token), ""))
 
-# Snapshot the user's coin balance and tx ledger BEFORE any redemption.
+# Snapshot the user's coin balance BEFORE any redemption.
 with SessionLocal() as db:
     coin_before = db.get(User, uuid.UUID(user_id)).coin_balance
-    tx_before = db.execute(
-        text("SELECT count(*) FROM coin_transactions WHERE user_id = :uid"), {"uid": user_id}
-    ).scalar()
 
 
 def redeem(code: str, headers: dict | None = None):
@@ -181,16 +194,17 @@ results.append(("expired code -> 410", response.status_code == 410, str(response
 response = redeem(CODE_OVERDUE, headers=AUTH)
 results.append(("active code past expires_at -> 410", response.status_code == 410, str(response.status_code)))
 
-# --- 6. Valid active code -> 200 and the row is actually REDEEMED ---------------------------
+# --- 6. Valid active code -> 200, the row is REDEEMED, and coins are awarded ---
 response = redeem(CODE_VALID, headers=AUTH)
 body = response.json()
+expected_balance = coin_before + VALID_COIN_VALUE
 ok_resp = (
     response.status_code == 200
     and body.get("message") == "Code redeemed successfully"
-    and body.get("qr_id") is not None
-    and body.get("redeemed_at") is not None
+    and body.get("coins_earned") == VALID_COIN_VALUE
+    and body.get("balance") == expected_balance
 )
-results.append(("valid code -> 200 with message/qr_id/redeemed_at", ok_resp, str(body)))
+results.append(("valid code -> 200 with message/coins_earned/balance", ok_resp, str(body)))
 
 with SessionLocal() as db:
     qr = db.execute(select(QRCode).where(QRCode.code == CODE_VALID)).scalar_one()
@@ -205,10 +219,10 @@ results.append(
 )
 
 # --- 7. Response exposes ONLY the safe fields ------------------------------------------------
-SAFE_FIELDS = {"message", "qr_id", "redeemed_at"}
-INTERNAL = {"code", "product_id", "coin_value", "status", "redeemed_by_user_id", "expires_at", "created_at"}
+SAFE_FIELDS = {"message", "coins_earned", "balance"}
+INTERNAL = {"code", "qr_id", "product_id", "coin_value", "status", "redeemed_by_user_id", "expires_at", "created_at", "redeemed_at"}
 ok = set(body) == SAFE_FIELDS and all(k not in body for k in INTERNAL)
-results.append(("response exposes only message/qr_id/redeemed_at", ok, str(sorted(body.keys()))))
+results.append(("response exposes only message/coins_earned/balance", ok, str(sorted(body.keys()))))
 
 # --- 8. Same code by the same user again -> 409, no second redemption -------------------------
 response = redeem(CODE_VALID, headers=AUTH)
@@ -227,16 +241,16 @@ with SessionLocal() as db:
     still_mine = qr.redeemed_by_user_id == uuid.UUID(user_id)
 results.append(("a second user redeeming the same code -> 409, owner unchanged", response.status_code == 409 and still_mine, str(response.status_code)))
 
-# --- 10. Redemption never touches coins (Step 3's job) -------------------------------------------
+# --- 10. Step 3: coins ARE awarded — balance up, one ledger row --------------------------------
 with SessionLocal() as db:
     user = db.get(User, uuid.UUID(user_id))
     tx_after = db.execute(
         text("SELECT count(*) FROM coin_transactions WHERE user_id = :uid"), {"uid": user_id}
     ).scalar()
-ok = user.coin_balance == coin_before and tx_after == tx_before == 0
+ok = user.coin_balance == coin_before + VALID_COIN_VALUE and tx_after == 1
 results.append(
-    ("redemption leaves coin_balance and coin_transactions untouched", ok,
-     f"coin={user.coin_balance} txs={tx_after}")
+    ("redemption credits coin_balance by coin_value and writes ONE ledger row",
+     ok, f"coin={user.coin_balance} txs={tx_after}")
 )
 
 try:
