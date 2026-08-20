@@ -11,20 +11,28 @@ export default function CreateQrModal({ onCreated, onClose }) {
   const [expiresAt, setExpiresAt] = useState('')
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [loadingProducts, setLoadingProducts] = useState(true)
 
   useEffect(() => {
     api
       .products()
       .then((data) => {
         setProducts(data.items)
-        if (data.items.length === 1) setProductId(data.items[0].product_id)
+        // Default to the first product so the dropdown has a real selection;
+        // otherwise productId stays "" and the create call fails validation.
+        if (data.items.length > 0) setProductId((current) => current || data.items[0].product_id)
       })
       .catch((err) => setError(err.message))
+      .finally(() => setLoadingProducts(false))
   }, [])
 
   const submit = async (event) => {
     event.preventDefault()
     setError(null)
+    if (!productId) {
+      setError('Please select a product first.')
+      return
+    }
     setSubmitting(true)
     try {
       const body = { product_id: productId, coin_value: Number(coinValue) }
@@ -54,16 +62,22 @@ export default function CreateQrModal({ onCreated, onClose }) {
               value={productId}
               onChange={(e) => setProductId(e.target.value)}
               required
-              disabled={products.length === 0}
+              disabled={loadingProducts || products.length === 0}
             >
-              {products.length === 0 && <option value="">No products available</option>}
+              {loadingProducts && <option value="">Loading products…</option>}
+              {!loadingProducts && products.length === 0 && (
+                <option value="">No products available</option>
+              )}
               {products.map((p) => (
                 <option key={p.product_id} value={p.product_id}>
                   {p.name} ({p.sku})
                 </option>
               ))}
             </select>
-            {products.length === 0 && (
+            {loadingProducts && (
+              <small className="field-hint">Fetching products…</small>
+            )}
+            {!loadingProducts && products.length === 0 && (
               <small className="field-hint">
                 Add products to the database first — no products exist yet.
               </small>
@@ -95,7 +109,7 @@ export default function CreateQrModal({ onCreated, onClose }) {
             <button
               type="submit"
               className="btn btn-primary"
-              disabled={submitting || products.length === 0}
+              disabled={submitting || loadingProducts || products.length === 0}
             >
               {submitting ? 'Creating…' : 'Create'}
             </button>

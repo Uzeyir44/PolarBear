@@ -8,6 +8,8 @@ import QrCodesPage from './pages/QrCodesPage'
 import QrDetailPage from './pages/QrDetailPage'
 import UsersPage from './pages/UsersPage'
 import UserDetailPage from './pages/UserDetailPage'
+import ProductsPage from './pages/ProductsPage'
+import ProductDetailPage from './pages/ProductDetailPage'
 
 export default function App() {
   return (
@@ -29,6 +31,8 @@ export default function App() {
             <Route path="qr-codes/:qrId" element={<QrDetailPage />} />
             <Route path="users" element={<UsersPage />} />
             <Route path="users/:userId" element={<UserDetailPage />} />
+            <Route path="products" element={<ProductsPage />} />
+            <Route path="products/:productId" element={<ProductDetailPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

@@ -58,7 +58,19 @@ export const api = {
   getQr: (qrId) => request(`/admin/qr-codes/${qrId}`),
   updateQrStatus: (qrId, status) =>
     request(`/admin/qr-codes/${qrId}`, { method: 'PATCH', body: { status } }),
-  products: () => request('/admin/qr-codes/products'),
+  products: () => request('/admin/products?limit=100'),
+  listProducts: (params) => {
+    const query = new URLSearchParams()
+    if (params.q) query.set('q', params.q)
+    query.set('limit', String(params.limit || 20))
+    query.set('offset', String(params.offset || 0))
+    return request(`/admin/products?${query.toString()}`)
+  },
+  getProduct: (productId) => request(`/admin/products/${productId}`),
+  createProduct: (body) => request('/admin/products', { method: 'POST', body }),
+  updateProduct: (productId, body) =>
+    request(`/admin/products/${productId}`, { method: 'PATCH', body }),
+  deleteProduct: (productId) => request(`/admin/products/${productId}`, { method: 'DELETE' }),
   listUsers: (params) => {
     const query = new URLSearchParams()
     if (params.q) query.set('q', params.q)

@@ -54,15 +54,6 @@ class QRAdminCreate(BaseModel):
     )
 
 
-class QRAdminProductList(BaseModel):
-    """Read-only product choices for the QR creation form. There is no
-    product management here — this is the bare minimum an administrator
-    needs to target a QR code at an existing product."""
-
-    items: list[QRAdminProduct]
-    total: int
-
-
 class QRAdminUpdate(BaseModel):
     """Body of PATCH /admin/qr-codes/{qr_id}.
 

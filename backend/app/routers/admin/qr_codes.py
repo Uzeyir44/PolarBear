@@ -41,8 +41,6 @@ from app.models import Product, QRCode, QRStatus, User
 from app.schemas.admin_qr import (
     QRAdminCreate,
     QRAdminList,
-    QRAdminProduct,
-    QRAdminProductList,
     QRAdminRead,
     QRAdminUpdate,
 )
@@ -59,24 +57,6 @@ _ALLOWED_TRANSITIONS: dict[QRStatus, set[QRStatus]] = {
     QRStatus.ACTIVE: {QRStatus.EXPIRED},   # deactivate a live code
     QRStatus.EXPIRED: {QRStatus.ACTIVE},   # reactivate (operator correction)
 }
-
-
-@router.get("/products", response_model=QRAdminProductList)
-def list_products(
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-) -> QRAdminProductList:
-    """Read-only list of products for the QR creation form. Not product
-    management — just the choices an administrator needs when generating
-    a code. Add a full admin products module later, separately."""
-    products = db.execute(select(Product).order_by(Product.name)).scalars().all()
-    return QRAdminProductList(
-        items=[
-            QRAdminProduct(product_id=p.product_id, name=p.name, sku=p.sku)
-            for p in products
-        ],
-        total=len(products),
-    )
 
 
 @router.get("", response_model=QRAdminList)

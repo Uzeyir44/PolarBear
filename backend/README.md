@@ -557,7 +557,9 @@ venv/Scripts/python -m tests.test_admin_users
 
 `test_user_coins.py` verifies the read side: missing/invalid/expired token → `401` on both endpoints; `GET /users/me/coins` returns the exact `coin_balance` from PostgreSQL; a client-supplied `user_id` query param is ignored; `GET /users/me/transactions` returns all of the user's rows in newest-first order with every row exposing only the whitelisted fields (`transaction_id`, `amount`, `balance_after`, `transaction_type`, `direction`, `created_at`, `qr`, and the nullable `competition_id`/`wardrobe_id`/`vote_id`); a real QR redemption surfaces with its QR code and product name; debit rows serialize as `direction: DEBIT` with negative amounts; `limit`/`offset` pagination tiles the full history with no overlap and empties beyond the end; another user's transactions are invisible (user B sees only B's rows) and balances are separate; empty history → `[]`; and invalid `limit`/`offset` (0, 51, -1, non-numeric, negative offset) → `422`. All test data is cleaned up afterward.
 
-`test_admin_qr.py` verifies the internal admin console: unauthenticated → `401` and normal users → `403` on every `/admin/*` endpoint; an administrator is granted access; `GET /admin/qr-codes` paginates newest-first with `total`/`limit`/`offset` and supports `status`/`product_id` filters; `GET /admin/qr-codes/{qr_id}` returns the product and (for redeemed codes) who redeemed it and when; `POST /admin/qr-codes` returns `201` with a generated unique `PB-` code that appears in the list, rejects a nonexistent product with `404` and non-positive coin values with `422`; `PATCH /admin/qr-codes/{qr_id}` allows ACTIVE ⇄ EXPIRED (deactivate/reactivate) but rejects ACTIVE → REDEEMED and any change to a REDEEMED code with `409` (audit trail), returning `404` for nonexistent codes; and a normal user's attempts — list, create, status change — are all denied with `403` and the rows are left untouched. The read-only product list for the create form (`GET /admin/qr-codes/products`) is covered too. All test data is cleaned up afterward.
+`test_admin_qr.py` verifies the internal admin console: unauthenticated → `401` and normal users → `403` on every `/admin/*` endpoint; an administrator is granted access; `GET /admin/qr-codes` paginates newest-first with `total`/`limit`/`offset` and supports `status`/`product_id` filters; `GET /admin/qr-codes/{qr_id}` returns the product and (for redeemed codes) who redeemed it and when; `POST /admin/qr-codes` returns `201` with a generated unique `PB-` code that appears in the list, rejects a nonexistent product with `404` and non-positive coin values with `422`; `PATCH /admin/qr-codes/{qr_id}` allows ACTIVE ⇄ EXPIRED (deactivate/reactivate) but rejects ACTIVE → REDEEMED and any change to a REDEEMED code with `409` (audit trail), returning `404` for nonexistent codes; and a normal user's attempts — list, create, status change — are all denied with `403` and the rows are left untouched. The product list used by the create form is now served by the dedicated `GET /admin/products` module and is covered there. All test data is cleaned up afterward.
+
+`test_admin_products.py` verifies the product-management module: unauthenticated → `401` and normal users → `403` on every `/admin/products` endpoint (list, detail, create, update, delete) with an administrator granted; `GET /admin/products` paginates newest-first with `total`/`limit`/`offset`, supports case-insensitive, ILIKE-escaped name/SKU search, and exposes only `product_id`/`name`/`sku`/`created_at`/`qr_code_count`; `GET /admin/products/{product_id}` returns the full safe view (with `qr_code_count`) and `404` for a nonexistent product; `POST` returns `201` with a database-generated `product_id`/`created_at`, trims whitespace, rejects a duplicate SKU with `409` and blank fields with `422`, and ignores client-supplied id/timestamp; `PATCH` updates name and/or SKU, cannot change `product_id`/`created_at`, rejects a SKU already in use by another product with `409`, and returns `404`/`422` as appropriate; `DELETE` removes an unreferenced product (`204`) but refuses a product referenced by QR codes with `409`, leaving the row and its audit history untouched; and a QR created against a product is reflected in `qr_code_count` and blocks deletion. All test data is cleaned up afterward.
 
 ## Admin panel
 
@@ -585,16 +587,20 @@ UPDATE users SET is_admin = true WHERE username = '<your-admin-username>';
 | `POST` | `/admin/qr-codes` | Generate a new active QR code (`product_id`, `coin_value`, optional `expires_at`) |
 | `GET` | `/admin/qr-codes/{qr_id}` | Full administrative detail incl. redemptions |
 | `PATCH` | `/admin/qr-codes/{qr_id}` | Deactivate (`active → expired`) or reactivate (`expired → active`) |
-| `GET` | `/admin/qr-codes/products` | Read-only product choices for the create form |
+| `GET` | `/admin/products` | Paginated product list, newest first; `q` (name/SKU) search; each row has `qr_code_count` |
+| `GET` | `/admin/products/{product_id}` | Full administrative detail incl. QR reference count |
+| `POST` | `/admin/products` | Create a product (`name`, unique `sku`) — `201`, id/timestamp DB-generated |
+| `PATCH` | `/admin/products/{product_id}` | Update `name` and/or `sku`; `product_id`/`created_at` are immutable |
+| `DELETE` | `/admin/products/{product_id}` | Delete an unreferenced product; `409` if QR codes reference it |
 | `GET` | `/admin/users` | Paginated user list, newest first; `q` (username/email) search and `is_active` filter |
 | `GET` | `/admin/users/{user_id}` | Safe administrative detail for one user |
 | `PATCH` | `/admin/users/{user_id}/status` | Deactivate (`{"is_active": false}`) or reactivate a user |
 
-Status rules are enforced on the server: only `ACTIVE ⇄ EXPIRED` transitions are allowed; `REDEEMED` codes are immutable (they are audit history) and `ACTIVE → REDEEMED` is rejected with `409`. Users are never deleted — toggling `is_active` is the only administrative mutation, and an administrator cannot deactivate their own account (`400`).
+Status rules are enforced on the server: only `ACTIVE ⇄ EXPIRED` transitions are allowed; `REDEEMED` codes are immutable (they are audit history) and `ACTIVE → REDEEMED` is rejected with `409`. Users are never deleted — toggling `is_active` is the only administrative mutation, and an administrator cannot deactivate their own account (`400`). Products are edited in place (`name`/`sku`); `product_id` and `created_at` are database-owned, and a product referenced by QR codes cannot be deleted (the `RESTRICT` FK would break audit history, so the API returns `409`).
 
 ### Admin frontend
 
-Pages: `/login` (admin sign-in; an authenticated non-admin is refused), `/dashboard`, `/qr-codes` (list with filters, pagination, refresh, create modal, deactivate/reactivate with confirmation), `/qr-codes/:id` (details + status actions). A normal user's token never grants access — the UI hides nothing, the backend enforces everything.
+Pages: `/login` (admin sign-in; an authenticated non-admin is refused), `/dashboard`, `/qr-codes` (list with filters, pagination, refresh, create modal, deactivate/reactivate with confirmation), `/qr-codes/:id` (details + status actions), `/products` (searchable table with create/edit/delete, QR-reference states), `/products/:id` (details + edit + guarded delete), `/users` (search/filter table), `/users/:id` (details + status actions). A normal user's token never grants access — the UI hides nothing, the backend enforces everything.
 
 ### Manual QR workflow test
 
@@ -620,6 +626,20 @@ Pages: `/login` (admin sign-in; an authenticated non-admin is refused), `/dashbo
 9. As a plain (non-admin) account, attempt to open `/users` in the browser → the panel redirects to login and every `/admin/users` API call returns 403.
 
 See `test_admin_users.py` for the automated coverage of all of the above.
+
+### Manual product-management workflow test
+
+1. With the panel open as an administrator, click **Products** in the sidebar.
+2. Click **New product** → enter a name and a unique SKU → **Create** → the row appears in the table with `QR refs = 0`.
+3. Try **New product** again with the **same SKU** → the backend rejects it (`409`, "A product with this SKU already exists").
+4. Type in the search box → the list narrows to matching names/SKUs.
+5. Click **View** on the product → detail page shows `product_id`, name, SKU, `created_at`, and QR reference count.
+6. Click **Edit product** → change the name (and/or SKU) → **Save changes** → the detail page reflects the change; `product_id`/`created_at` stay identical.
+7. In **QR Codes**, click **Create QR** and pick this product → **Create** → now `QR refs` on the product becomes `1`.
+8. Back on the product detail/table, the **Delete** button is disabled ("Referenced by QR codes"); even a direct `DELETE /admin/products/{id}` returns `409`.
+9. Create a second, unreferenced product → its **Delete** button is enabled → delete it with confirmation → the row disappears.
+
+See `test_admin_products.py` for the automated coverage of all of the above.
 
 ## Test users
 

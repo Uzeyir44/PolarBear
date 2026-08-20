@@ -23,10 +23,10 @@ export default function DashboardPage() {
           <div className="card-title">Clothing</div>
           <div className="card-desc">Coming in a later release.</div>
         </div>
-        <div className="card card-planned">
+        <Link className="card card-link" to="/products">
           <div className="card-title">Products</div>
-          <div className="card-desc">Coming in a later release.</div>
-        </div>
+          <div className="card-desc">Manage products — QR codes link to these.</div>
+        </Link>
         <div className="card card-planned">
           <div className="card-title">Competitions</div>
           <div className="card-desc">Coming in a later release.</div>

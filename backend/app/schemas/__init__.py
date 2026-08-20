@@ -6,12 +6,12 @@ from .admin_qr import (
     QRAdminCreate,
     QRAdminList,
     QRAdminProduct,
-    QRAdminProductList,
     QRAdminRead,
     QRAdminRedeemedBy,
     QRAdminUpdate,
 )
 from .user_admin import UserAdminList, UserAdminRead, UserAdminStatusUpdate
+from .product import ProductAdminCreate, ProductAdminList, ProductAdminRead, ProductAdminUpdate
 
 __all__ = [
     "CoinBalance",
@@ -28,11 +28,14 @@ __all__ = [
     "QRAdminCreate",
     "QRAdminList",
     "QRAdminProduct",
-    "QRAdminProductList",
     "QRAdminRead",
     "QRAdminRedeemedBy",
     "QRAdminUpdate",
     "UserAdminList",
     "UserAdminRead",
     "UserAdminStatusUpdate",
+    "ProductAdminCreate",
+    "ProductAdminList",
+    "ProductAdminRead",
+    "ProductAdminUpdate",
 ]

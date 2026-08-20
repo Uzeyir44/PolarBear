@@ -146,7 +146,7 @@ results.append(("regular user login works", bool(USER_TOKEN), ""))
 
 
 # --- 1. Authorization: 401 / 403 / granted everywhere -----------------------
-ADMIN_ENDPOINTS = ["/admin/me", "/admin/qr-codes", "/admin/qr-codes/products"]
+ADMIN_ENDPOINTS = ["/admin/me", "/admin/qr-codes", "/admin/products"]
 for path in ADMIN_ENDPOINTS:
     results.append((f"unauth {path} -> 401", client.get(path).status_code == 401, str(client.get(path).status_code)))
     results.append((f"normal user {path} -> 403", client.get(path, headers=USER_AUTH).status_code == 403, str(client.get(path, headers=USER_AUTH).status_code)))
@@ -155,7 +155,9 @@ for path in ADMIN_ENDPOINTS:
 results.append(("admin /admin/me reports is_admin", client.get("/admin/me", headers=ADMIN_AUTH).json().get("is_admin") is True, ""))
 results.append(("normal user cannot write QR either", client.post("/admin/qr-codes", headers=USER_AUTH, json={"product_id": str(product_id), "coin_value": COIN_VALUE}).status_code == 403, ""))
 
-response = client.get("/admin/qr-codes/products", headers=ADMIN_AUTH)
+# Products for the QR create form now come from the dedicated admin products
+# module (GET /admin/products); the old /admin/qr-codes/products endpoint is gone.
+response = client.get("/admin/products", params={"q": "Cola 330ml"}, headers=ADMIN_AUTH)
 product_names = [p["name"] for p in response.json()["items"]]
 results.append(("admin can list products for the QR form", response.status_code == 200 and "Cola 330ml" in product_names, str(product_names)))
 

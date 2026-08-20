@@ -8,6 +8,7 @@ export default function Layout() {
   const items = [
     { to: '/dashboard', label: 'Dashboard', end: true },
     { to: '/qr-codes', label: 'QR Codes', end: false },
+    { to: '/products', label: 'Products', end: false },
     { to: '/users', label: 'Users', end: false },
   ]
 

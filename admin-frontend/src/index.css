@@ -358,6 +358,12 @@ a {
   color: #e74c3c;
 }
 
+.pill-refs {
+  background: rgba(52, 152, 219, 0.15);
+  color: var(--primary);
+  text-transform: none;
+}
+
 .pill-inactive {
   background: rgba(139, 148, 167, 0.2);
   color: #aeb6c2;
@@ -494,6 +500,16 @@ a {
 
 .actions-card .btn {
   margin-top: 6px;
+}
+
+.actions-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.actions-card .actions-row .btn {
+  margin-top: 0;
 }
 
 /* ---------- Pagination ---------- */
