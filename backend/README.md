@@ -68,12 +68,19 @@ app/
 │   ├── user.py           # UserRegister/UserUpdate (input), UserRead/UserPublic (output)
 │   ├── token.py          # LoginRequest (input), Token (output)
 │   ├── qr.py             # QRCodeRedeemRequest (input), QRCodeRedemptionResult (output)
-│   └── coin.py           # CoinBalance / CoinTransactionRead / QRTransactionReference (output)
+│   ├── coin.py           # CoinBalance / CoinTransactionRead / QRTransactionReference (output)
+│   ├── admin.py          # AdminUserRead (output) — GET /admin/me
+│   ├── admin_qr.py       # QR admin input/output schemas
+│   ├── product.py        # Product admin input/output schemas
+│   ├── user_admin.py     # User admin input/output schemas
+│   └── clothing.py       # ClothingItemRead / ClothingCategoryRef / ClothingItemList (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
 │   ├── users.py          # /users/me, /users/me/coins, /users/me/transactions,
 │   │                     # PATCH /users/me, /users/search, follow/unfollow/follow-status
 │   ├── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
+│   ├── clothing.py       # GET /clothing — browse the shop (authenticated, paginated,
+│   │                     # category filter, AVAILABLE-only)
 │   └── admin/            # Internal admin console (every route behind get_current_admin)
 │       ├── __init__.py   # /admin/me + mounts /admin/qr-codes and /admin/users
 │       ├── qr_codes.py   # /admin/qr-codes CRUD + status management, /admin/.../products
@@ -89,8 +96,10 @@ tests/                   # End-to-end test scripts (run with python -m tests.<na
 ├── test_qr_redeem_coins.py# End-to-end coin-award checks (Step 3)
 ├── test_user_coins.py    # End-to-end GET /users/me/coins and /users/me/transactions
 ├── test_admin_qr.py      # End-to-end admin auth + QR management checks
-└── test_admin_users.py   # End-to-end admin auth + user management checks
-alembic/                  # Migrations (initial_schema, users.is_admin flag)
+├── test_admin_users.py   # End-to-end admin auth + user management checks
+├── test_admin_products.py# End-to-end admin product-management checks
+└── test_clothing_browse.py # End-to-end GET /clothing browse checks
+alembic/                  # Migrations (initial_schema, users.is_admin flag, clothing seed)
 ```
 
 ## What's implemented so far
@@ -483,6 +492,53 @@ Response (`200 OK`) — `transaction_type`/`direction`/`qr` populated because th
 - The response schemas (`CoinBalance`, `CoinTransactionRead`, `QRTransactionReference` in `app/schemas/coin.py`) are output-only — they define exactly which fields can appear, so a leaked internal column would be dropped by FastAPI's `response_model` filtering even if it were ever returned.
 - The query always filters by `current_user.user_id`; there is no code path that reads another user's rows.
 
+## Clothing shop — browse (`GET /clothing`)
+
+The first Phase 3 (clothing shop) endpoint: an authenticated client browses the catalog with pagination and an optional category filter. Requires `Authorization: Bearer <token>`; without a valid token → `401`.
+
+Query parameters:
+
+| Param | Rules |
+| --- | --- |
+| `category_id` | Optional. A `clothing_categories.category_id` (`SMALLINT`, 1–32767). Returns only items from that category. A nonexistent in-range id → `404`; a non-integer, out-of-range, or non-positive value → `422`. |
+| `limit` | Optional, default `20`, min `1`, max `100`. Out of range → `422`. |
+| `offset` | Optional, default `0`, min `0`. Negative → `422`. |
+
+Example:
+
+```
+GET /clothing?category_id=3&limit=2&offset=0
+Authorization: Bearer <JWT>
+```
+
+Response (`200 OK`):
+
+```json
+{
+  "items": [
+    {
+      "item_id": "…",
+      "name": "Polar Hoodie",
+      "description": "Heavyweight fleece with a hidden pocket.",
+      "category": { "category_id": 3, "category_name": "Tops", "slot": "top" },
+      "price": 500,
+      "image_url": "https://mycolabear.example.com/clothing/tops/polar-hoodie.png",
+      "availability_status": "available",
+      "collection_id": null
+    }
+  ],
+  "total": 12,
+  "limit": 2,
+  "offset": 0
+}
+```
+
+The response is whitelisted by `ClothingItemRead` (`app/schemas/clothing.py`): only `item_id`, `name`, `description`, `category` (nested id/name/slot), `price`, `image_url`, `availability_status`, and `collection_id` are exposed — no FK housekeeping, no `created_at`, nothing internal.
+
+**Availability rule.** Browsing shows **only `AVAILABLE` items**. `UNAVAILABLE` items are sold out / withdrawn catalog entries (the design doc says to set `availability_status='unavailable'` instead of deleting them) and `UPCOMING` items are not purchasable yet — neither appears in the shop shelf, and only AVAILABLE items count towards `total`. This is an explicit product decision (the design doc itself does not state a browse rule); see `app/routers/clothing.py` for the full reasoning.
+
+**Ordering / performance.** Results are deterministic: `ORDER BY created_at DESC, item_id DESC`, so repeated requests over the same data paginate stably. The category context is loaded in the same query (`joinedload`), so there is no N+1. No schema change was required: both `clothing_items` and `clothing_categories` already existed; the catalog entries (see **Seed data** below) were added by a data-only migration (`e833bac26dfc`).
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -539,6 +595,10 @@ venv/Scripts/python -m tests.test_admin_qr
 # username+email search, is_active filter, detail 404s, deactivate/reactivate
 # incl. login enforcement + self-deactivation guard, no password leakage)
 venv/Scripts/python -m tests.test_admin_users
+
+# Clothing browse end-to-end (401s, 200s, AVAILABLE-only rule, category
+# filter/404/422s, deterministic ordering, pagination, response whitelist)
+venv/Scripts/python -m tests.test_clothing_browse
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -560,6 +620,80 @@ venv/Scripts/python -m tests.test_admin_users
 `test_admin_qr.py` verifies the internal admin console: unauthenticated → `401` and normal users → `403` on every `/admin/*` endpoint; an administrator is granted access; `GET /admin/qr-codes` paginates newest-first with `total`/`limit`/`offset` and supports `status`/`product_id` filters; `GET /admin/qr-codes/{qr_id}` returns the product and (for redeemed codes) who redeemed it and when; `POST /admin/qr-codes` returns `201` with a generated unique `PB-` code that appears in the list, rejects a nonexistent product with `404` and non-positive coin values with `422`; `PATCH /admin/qr-codes/{qr_id}` allows ACTIVE ⇄ EXPIRED (deactivate/reactivate) but rejects ACTIVE → REDEEMED and any change to a REDEEMED code with `409` (audit trail), returning `404` for nonexistent codes; and a normal user's attempts — list, create, status change — are all denied with `403` and the rows are left untouched. The product list used by the create form is now served by the dedicated `GET /admin/products` module and is covered there. All test data is cleaned up afterward.
 
 `test_admin_products.py` verifies the product-management module: unauthenticated → `401` and normal users → `403` on every `/admin/products` endpoint (list, detail, create, update, delete) with an administrator granted; `GET /admin/products` paginates newest-first with `total`/`limit`/`offset`, supports case-insensitive, ILIKE-escaped name/SKU search, and exposes only `product_id`/`name`/`sku`/`created_at`/`qr_code_count`; `GET /admin/products/{product_id}` returns the full safe view (with `qr_code_count`) and `404` for a nonexistent product; `POST` returns `201` with a database-generated `product_id`/`created_at`, trims whitespace, rejects a duplicate SKU with `409` and blank fields with `422`, and ignores client-supplied id/timestamp; `PATCH` updates name and/or SKU, cannot change `product_id`/`created_at`, rejects a SKU already in use by another product with `409`, and returns `404`/`422` as appropriate; `DELETE` removes an unreferenced product (`204`) but refuses a product referenced by QR codes with `409`, leaving the row and its audit history untouched; and a QR created against a product is reflected in `qr_code_count` and blocks deletion. All test data is cleaned up afterward.
+
+`test_clothing_browse.py` verifies the shop browsing surface: missing/invalid/expired token → `401` on `GET /clothing` and a valid token → `200`; unfiltered listing returns only the whitelisted item fields (`item_id`, `name`, `description`, `category` → `category_id`/`category_name`/`slot`, `price`, `image_url`, `availability_status`, `collection_id`); ordering is deterministic (`created_at DESC`, `item_id DESC` tiebreak) — a repeated request is identical and matches a direct DB query; `limit`/`offset` pagination tiles the result set with no overlap and empties past the end with a correct `total`; filtering by a real category id returns only that category's items; a category with no AVAILABLE items returns `total: 0`; the AVAILABLE-only rule hides `UNAVAILABLE` and `UPCOMING` items; a nonexistent in-range `category_id` → `404`; non-integer/out-of-range/zero/negative `category_id` and invalid `limit`/`offset` → `422`; `collection_id` round-trips when set and is `null` otherwise; and `availability_status` serializes to `"available"`. The test creates its own categories/items (RUN_ID-isolated) and cleans everything up afterward.
+
+## Seed data
+
+Everything below is reference/development data inserted by Alembic migrations (`op.bulk_insert`, applied by `alembic upgrade head`) — it is **not** created by the application. Database-generated ids (`category_id`/`type_id`/`status_id`) below therefore depend on the seed order; the seeds resolve category ids by name, not by hard-coded number.
+
+### Clothing categories (from `310bd16d3308`)
+
+| `category_id` | `category_name` | `slot` |
+| --- | --- | --- |
+| 1 | Hairstyles | hair |
+| 2 | Hats | hat |
+| 3 | Tops | top |
+| 4 | Bottoms | bottom |
+| 5 | Sneakers | shoes |
+| 6 | Sunglasses | accessory |
+
+### Clothing items — the shop catalog (from `e833bac26dfc`)
+
+18 items, 12 `AVAILABLE` / 3 `UNAVAILABLE` / 3 `UPCOMING` — enough to exercise normal browsing, category filtering, pagination, and price/availability variety. `item_id` and `created_at` are database-generated (`gen_random_uuid()` / `now()`); `collection_id` is `NULL` for all seeds.
+
+| Name | Category | Price | Availability | Description |
+| --- | --- | --- | --- | --- |
+| Windblown Waves | Hairstyles | 300 | AVAILABLE | *(no description)* |
+| Classic Crew Cut | Hairstyles | 250 | AVAILABLE | A timeless, low-maintenance trim. |
+| Neon Faux Hawk | Hairstyles | 400 | UPCOMING | Summer drop — the most electric hair in town. |
+| Polar Snapback | Hats | 350 | AVAILABLE | Flat brim, adjustable strap, ice-cold fit. |
+| Sunrise Bucket Hat | Hats | 200 | AVAILABLE | Beach-ready and fully reversible. |
+| Winter Toque Deluxe | Hats | 280 | UNAVAILABLE | Sold out for the season — cozy fleece lining. |
+| Cola Classic Tee | Tops | 150 | AVAILABLE | The everyday classic, 100% cotton. |
+| Polar Hoodie | Tops | 500 | AVAILABLE | Heavyweight fleece with a hidden pocket. |
+| Limited Cold Brew Jacket | Tops | 900 | UPCOMING | Releasing soon — the collectors' piece. |
+| Soda Pop Shorts | Bottoms | 180 | AVAILABLE | Lightweight summer shorts, two zip pockets. |
+| Chill Cargo Pants | Bottoms | 420 | AVAILABLE | Six pockets, tapered fit, zero compromises. |
+| Retro Racer Tracksuit Pants | Bottoms | 380 | UNAVAILABLE | Limited run from last season. |
+| Fizzy Kicks | Sneakers | 600 | AVAILABLE | Bubble-soled sneakers with a carbon pop of colour. |
+| Bubbles Running Shoes | Sneakers | 550 | AVAILABLE | Cushioned everyday runners. |
+| Midnight Cola High-Tops | Sneakers | 750 | UPCOMING | Dropping soon — midnight gloss upper. |
+| Polar Shades | Sunglasses | 120 | AVAILABLE | Classic aviator cut with UV400 protection. |
+| Ice Cool Sunglasses | Sunglasses | 140 | AVAILABLE | Frost-tinted lenses for bright days. |
+| Retro Cola Aviators | Sunglasses | 220 | UNAVAILABLE | Iconic gold frame from the archive vault. |
+
+Each image URL is `https://mycolabear.example.com/clothing/<category>/<slug>.png` (placeholder host, not a real CDN).
+
+### Coin transaction types (from `310bd16d3308`)
+
+| `type_id` | `type_name` | `direction` |
+| --- | --- | --- |
+| 1 | qr_redemption | CREDIT |
+| 2 | competition_reward | CREDIT |
+| 3 | clothing_purchase | DEBIT |
+| 4 | vote_cast | DEBIT |
+| 5 | refund | CREDIT |
+| 6 | admin_adjustment | CREDIT |
+
+### Competition statuses (from `310bd16d3308`)
+
+| `status_id` | `status_name` |
+| --- | --- |
+| 1 | active |
+| 2 | completed |
+
+### Notification types (from `310bd16d3308`)
+
+| `type_id` | `type_name` |
+| --- | --- |
+| 1 | new_follower |
+| 2 | competition_request |
+| 3 | competition_accepted |
+| 4 | competition_won |
+| 5 | competition_lost |
+| 6 | qr_redeemed |
+| 7 | clothing_purchased |
 
 ## Admin panel
 
@@ -672,6 +806,27 @@ Notes:
 4. `PATCH /users/me` with header `Authorization: Bearer <token>` and a body like `{"biography": "My new biography"}` → `200` with the updated profile.
 5. `GET /users/search?q=alex` with header `Authorization: Bearer <token>` → `200` with a list of matching public profiles (excludes yourself).
 6. Negative cases: wrong password → `401`, unknown user → `401`, no header → `401`, garbage token → `401`, duplicate username → `409`, `{"username": ""}` → `422`, search with `q=` (empty) → `422`.
+
+### Clothing browsing (Phase 3)
+
+The catalog is seeded by `alembic upgrade head` (see **Seed data**), so it is available immediately. Log in as any test user and use their token:
+
+| Request | Expected |
+| --- | --- |
+| `GET /clothing` | `200` — paginated AVAILABLE-only catalog (`total` 12, ordering `created_at DESC`, `item_id DESC` tiebreak) |
+| `GET /clothing?category_id=3` | `200` — only Tops items (2 available: Cola Classic Tee, Polar Hoodie) |
+| `GET /clothing?limit=5&offset=5` | `200` — page of ≤ 5 items after skipping 5 |
+| `GET /clothing?category_id=2` | `200` — only the AVAILABLE Hats return (Polar Snapback, Sunrise Bucket Hat); Winter Toque Deluxe (`UNAVAILABLE`) never appears |
+| `GET /clothing?category_id=999` | `422` (out of SMALLINT range) |
+| `GET /clothing?category_id=32000` | `404` (in range but nonexistent) |
+| `GET /clothing` (no `Authorization` header) | `401` |
+| `GET /clothing?limit=0` / `offset=-1` / `category_id=abc` | `422` |
+
+Verify in the database:
+
+```sql
+SELECT name, category_id, price, availability_status FROM clothing_items ORDER BY created_at, item_id;
+```
 
 ### Complete follow flow (uses the test users above)
 
