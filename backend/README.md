@@ -75,7 +75,8 @@ app/
 │   ├── user_admin.py     # User admin input/output schemas
 │   ├── clothing_admin.py # Clothing admin input/output schemas
 │   ├── clothing.py       # ClothingItemRead / ClothingCategoryRef / ClothingItemList (output)
-│   └── wardrobe.py       # WardrobeEntryRead / WardrobeList (output)
+│   └── wardrobe.py       # WardrobeEntryRead / WardrobeList / EquipmentRead /
+│                         # EquipResult / UnequipResult (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
 │   ├── users.py          # /users/me, /users/me/coins, /users/me/transactions,
@@ -83,8 +84,8 @@ app/
 │   ├── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
 │   ├── clothing.py       # GET /clothing — browse the shop (authenticated, paginated,
 │   │                     # category filter, AVAILABLE-only)
-│   ├── wardrobe.py       # GET /wardrobe — the authenticated user's owned clothing
-│   │                     # (authenticated, paginated, newest-first)
+│   ├── wardrobe.py       # GET /wardrobe — owned clothing; POST|DELETE
+│   │                     # /wardrobe/{wardrobe_id}/equip — equip/unequip
 │   └── admin/            # Internal admin console (every route behind get_current_admin)
 │       ├── __init__.py   # /admin/me + mounts /admin/qr-codes, /admin/users,
 │       │                 # /admin/products and /admin/clothing
@@ -108,6 +109,9 @@ tests/                   # End-to-end test scripts (run with python -m tests.<na
 ├── test_clothing_browse.py # End-to-end GET /clothing browse checks
 ├── test_clothing_purchase.py # End-to-end POST /clothing/{item_id}/purchase checks
 ├── test_wardrobe.py        # End-to-end GET /wardrobe owned-clothing checks
+├── test_wardrobe_equip.py  # End-to-end equip/unequip checks (ownership, slots,
+│                           # replacement, unequip edge cases, availability,
+│                           # coin safety, concurrency)
 └── test_admin_clothing.py  # End-to-end admin auth + clothing-management checks
 alembic/                  # Migrations (initial_schema, users.is_admin flag, clothing seed)
 ```
@@ -594,7 +598,7 @@ No schema change was required for purchasing: `users.coin_balance`, `clothing_it
 
 ## Wardrobe — owned clothing (`GET /wardrobe`)
 
-The first Phase 4 (wardrobe) endpoint: an authenticated user lists the clothing they own. Requires `Authorization: Bearer <token>`; without a valid token → `401`. Read-only — equipping/unequipping lives in `avatar_equipment` and is a later phase.
+The first Phase 4 (wardrobe) endpoint: an authenticated user lists the clothing they own. Requires `Authorization: Bearer <token>`; without a valid token → `401`. Read-only — equipping/unequipping is covered by its own endpoints below.
 
 Query parameters (the project's standard limit/offset pagination):
 
@@ -641,6 +645,62 @@ Behavior and guarantees:
 The payload is whitelisted by `WardrobeEntryRead`/`WardrobeList` (`app/schemas/wardrobe.py`) reusing `ClothingItemRead` from `app/schemas/clothing.py` — no email, password hash, auth-provider, balance, or other internal fields anywhere in the response.
 
 No schema change was required: the read runs over the existing `user_wardrobe`, `clothing_items`, and `clothing_categories` tables.
+
+## Wardrobe — equip / unequip (`POST|DELETE /wardrobe/{wardrobe_id}/equip`)
+
+The second Phase 4 step: an authenticated user equips or unequips an item they own. Both endpoints require `Authorization: Bearer <token>` (→ `401` otherwise) and take **no request body** — the `wardrobe_id` in the URL path is the only client input.
+
+- `POST /wardrobe/{wardrobe_id}/equip` → `200` with the new slot state.
+- `DELETE /wardrobe/{wardrobe_id}/equip` → `200` confirming the cleared slot.
+
+Equip workflow (one transaction):
+
+1. **Ownership lookup** — one query loads the `user_wardrobe` row filtered by (`wardrobe_id` AND the JWT-derived `user_id`) with its item and category eagerly joined. Another user's `wardrobe_id` and a nonexistent one are indistinguishable → `404` "Wardrobe item not found". There is no `user_id`/`avatar_id`/`item_id`/`slot` client input anywhere.
+2. **Avatar resolution** — `avatars.user_id` is UNIQUE (0-or-1 per user) and registration does NOT create an avatar, so a missing avatar is a real state; it is reported explicitly as `404` "Avatar not found" rather than silently created here (avatar creation belongs to Phase 5 avatar setup).
+3. **Slot determination** — the slot comes ONLY from `clothing_items.category_id → clothing_categories.slot`. Sunglasses always land in ACCESSORY because their category says so; no client value can override this.
+4. **Atomic upsert** — one PostgreSQL statement: `INSERT INTO avatar_equipment (avatar_id, slot, item_id) … ON CONFLICT (avatar_id, slot) DO UPDATE SET item_id = excluded.item_id, equipped_at = now() RETURNING equipped_at`. An empty slot is filled; an occupied slot is REPLACED. The displaced item stays owned in `user_wardrobe`; nothing is charged and no ledger row is written — purchasing and equipping are separate operations.
+
+Response of equip (`200 OK`):
+
+```json
+{
+  "message": "Item equipped successfully",
+  "equipment": {
+    "avatar_id": "…",
+    "slot": "accessory",
+    "equipped_at": "2026-08-21T12:34:09.127468",
+    "item": {
+      "item_id": "…",
+      "name": "Polar Shades",
+      "description": "Classic aviator cut with UV400 protection.",
+      "category": { "category_id": 6, "category_name": "Sunglasses", "slot": "accessory" },
+      "price": 120,
+      "image_url": "https://mycolabear.example.com/clothing/sunglasses/polar-shades.png",
+      "availability_status": "available",
+      "collection_id": null
+    }
+  }
+}
+```
+
+Unequip deletes ONLY the row where THIS item occupies THIS slot of THIS avatar (`DELETE … WHERE avatar_id = … AND slot = … AND item_id = …`). If a different item is currently equipped there — or the slot is empty — nothing matches → `409` "This item is not currently equipped", so unequipping Shirt B can never remove Shirt A. The wardrobe record always remains owned. Response:
+
+```json
+{
+  "message": "Item unequipped successfully",
+  "avatar_id": "…",
+  "slot": "top"
+}
+```
+
+Guarantees:
+
+- **Concurrency** — the `avatar_equipment` primary key `(avatar_id, slot)` remains the structural one-item-per-slot guarantee. Two concurrent equips into the same slot serialize on that index entry inside the upsert and exactly one row survives (last writer wins, which is the intended semantics); there is no read-modify-write race because each request fully specifies the final state.
+- **Availability independence** — no availability check exists on either endpoint. An admin marking an owned/equipped item `UNAVAILABLE`/`UPCOMING` neither unequips it nor blocks managing it: availability governs buying, not owning or wearing.
+- **Coin safety** — equipping and unequipping never touch `users.coin_balance` and never create `coin_transactions` rows.
+- **Error cases** — missing/invalid/expired token → `401`; malformed uuid in the path → `422`; wardrobe row not found or owned by someone else → `404`; user has no avatar → `404` "Avatar not found"; unequip of an item not currently equipped in its slot → `409`.
+
+No schema change was required: everything runs over the existing `avatars`, `user_wardrobe`, `clothing_items`, `clothing_categories`, and `avatar_equipment` tables with their original constraints.
 
 ## Security notes
 
@@ -719,6 +779,13 @@ venv/Scripts/python -m tests.test_admin_clothing
 # between two users, owned UNAVAILABLE/UPCOMING items stay visible,
 # response field whitelists with no sensitive data)
 venv/Scripts/python -m tests.test_wardrobe
+
+# Equip/unequip end-to-end (401s, missing-avatar 404, successful equip with
+# DB row checks, ownership isolation both directions, slot determination for
+# all six categories, replacement within a slot, multi-slot coexistence,
+# unequip + incorrect-unequip 409, availability independence, coin safety,
+# concurrent equips into one slot)
+venv/Scripts/python -m tests.test_wardrobe_equip
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -748,6 +815,8 @@ venv/Scripts/python -m tests.test_wardrobe
 `test_admin_clothing.py` verifies the clothing-management module: unauthenticated → `401` and normal users → `403` on every `/admin/clothing*` endpoint (list, categories, detail, create, update, delete) with an administrator granted; `GET /admin/clothing/categories` returns all seeded lookup rows (id/name/slot) ordered by id; `POST` returns `201` with database-generated `item_id`/`created_at`, defaults availability to `available`, trims whitespace, accepts `price = 0` but rejects negatives/non-integers with `422`, rejects unknown categories with `404`, blank names/image URLs with `422`, non-enum availabilities with `422`, and ignores client-supplied id/timestamp; `GET /admin/clothing` paginates newest-first (matching a direct DB query), tiles pages without overlap, searches name AND description case-insensitively with ILIKE escaping, filters by category (`404` on unknown) and by each availability value — including `UNAVAILABLE`/`UPCOMING`, which admins see although public browse hides them — and exposes exactly the whitelisted fields; `GET /{item_id}` returns the full view and `404` for a nonexistent item; `PATCH` updates every catalog field independently (including clearing description/collection with `null` and moving an item to another category, inheriting its slot), revalidates the category, keeps `item_id`/`created_at` immutable, and returns `404`/`422` as appropriate; public compatibility: an admin-created `AVAILABLE` item appears in `GET /clothing` and is purchasable, marking it `UNAVAILABLE` removes it from browse and makes purchase return `409`; delete safety: a wardrobe-referenced item → `409` with both the item and the ownership record intact, an unreferenced item → `204` and gone, nonexistent → `404`. All test data is cleaned up afterward.
 
 `test_wardrobe.py` verifies the wardrobe listing: missing/invalid/expired token → `401` and a valid token → `200`; a user who never purchased gets `200` with `"items": []` and `"total": 0`; one real purchase surfaces as exactly one entry whose `wardrobe_id`, `purchased_at`, and catalog-shaped `item` match the purchase response and the DB row; multiple entries come back newest-purchase-first (`purchased_at DESC`, `wardrobe_id DESC` tiebreak, verified against controlled timestamps) with repeated requests returning an identical order; `limit`/`offset` pagination tiles the wardrobe without overlap or gaps, empties past the end with `total` intact, accepts the maximum limit of 100, and rejects invalid values with `422`; user isolation — two users with disjoint wardrobes each see only their own items, and a smuggled `?user_id=…` query parameter is ignored entirely; availability independence — owned items flipped to `UNAVAILABLE`/`UPCOMING` remain visible in the wardrobe; and data safety — the envelope exposes only `items`/`total`/`limit`/`offset`, each entry only `wardrobe_id`/`purchased_at`/`item`, the nested item matches the public catalog shape, and no username/email/password/auth-provider/balance/admin fields appear anywhere in the payload. All test users, items, and categories are cleaned up afterward.
+
+`test_wardrobe_equip.py` verifies equip/unequip end-to-end: missing/invalid/expired token → `401` on both endpoints; a registered user WITHOUT an avatar (registration does not create one) gets an explicit `404` "Avatar not found" instead of a silently created avatar; a valid equip → `200` with exactly the whitelisted fields (`message`, `equipment` → `avatar_id`/`slot`/`equipped_at`/catalog-shaped `item`) and exactly one `avatar_equipment` row with the caller's avatar, the category-derived slot, the owned item, and a server-written `equipped_at`; ownership isolation — user A equipping or unequipping user B's `wardrobe_id` → `404` with neither user's equipment changed; slot determination — items from all six categories (hair/hat/top/bottom/shoes/accessory) always land in their category's slot; replacement — equipping Shirt B over Shirt A in TOP leaves exactly one equipment row (Shirt B) while Shirt A stays owned in `user_wardrobe`; multi-slot coexistence — TOP + BOTTOM + SHOES (+ others) coexist on one avatar; unequip removes only the equipment row and keeps ownership; incorrect unequip — with Shirt A equipped, unequipping Shirt B → `409` "This item is not currently equipped" and Shirt A stays equipped (same for an owned-but-unequipped item); availability independence — an equipped item marked `UNAVAILABLE` stays equipped and can still be unequipped; coin safety — `coin_balance` unchanged and zero new `coin_transactions` rows after all equip/unequip traffic; nonexistent `wardrobe_id` → `404` and malformed uuid → `422` on both endpoints; no sensitive fields anywhere in payloads; and two concurrent HTTP equips of different shirts into TOP end with exactly ONE valid equipment row. All test users, avatars, items, and categories are cleaned up afterward.
 
 ## Seed data
 
@@ -1035,6 +1104,36 @@ Continuing from the purchase flow above (alice owns Polar Shades), with alice's 
 | Log in as **bob** and call `GET /wardrobe` | `200` with `"items": []`, `"total": 0` — bob cannot see alice's purchases |
 
 There is no `user_id` parameter on this endpoint: the wardrobe is always the caller's own. A smuggled `?user_id=<alice_user_id>` on bob's request changes nothing.
+
+### Wardrobe equip / unequip (Phase 4, part 2)
+
+Continuing from above (alice owns Polar Shades, category Sunglasses → slot `accessory`). Registration does **not** create an avatar, so first create one for alice directly in the DB:
+
+```sql
+INSERT INTO avatars (user_id) SELECT user_id FROM users WHERE username = 'alice';
+```
+
+Then, with alice's token (her `wardrobe_id` comes from the purchase response or `GET /wardrobe`):
+
+| Request | Expected |
+| --- | --- |
+| `POST /wardrobe/{alice_wardrobe_id}/equip` | `200` with `message`, `equipment` (`avatar_id`, `slot: "accessory"`, `equipped_at`, the Polar Shades item in the catalog shape); a row appears in `avatar_equipment` |
+| Same request again | `200` again — re-equipping your own item refreshes `equipped_at`, still exactly one row |
+| `DELETE /wardrobe/{alice_wardrobe_id}/equip` | `200` with `message`, `avatar_id`, `slot: "accessory"`; the `avatar_equipment` row is gone, the `user_wardrobe` row remains |
+| `DELETE` again | `409` ("This item is not currently equipped") |
+| `POST /wardrobe/{bob_wardrobe_id}/equip` with alice's token | `404` — bob's wardrobe is unreachable |
+| `POST /wardrobe/{random-uuid}/equip` | `404`; `/wardrobe/not-a-uuid/equip` → `422` |
+| Either endpoint without the `Authorization` header | `401` |
+
+Verify in the database after equipping:
+
+```sql
+SELECT e.slot, e.equipped_at, c.category_name, i.name
+FROM avatar_equipment e
+JOIN clothing_items i ON i.item_id = e.item_id
+JOIN clothing_categories c ON c.category_id = i.category_id
+WHERE e.avatar_id = '<alice_avatar_id>';
+```
 
 ### Complete follow flow (uses the test users above)
 
