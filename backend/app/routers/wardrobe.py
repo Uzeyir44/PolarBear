@@ -39,11 +39,13 @@ Equip/unequip specifics:
   clothing_items.category_id -> clothing_categories.slot. The client
   cannot name a slot; sunglasses always land in ACCESSORY because their
   category says so.
-- Avatar resolution: avatars.user_id is UNIQUE (0-or-1 per user) and NO
-  avatar is created at registration, so a missing avatar is a real
-  state. It is reported explicitly as 404 "Avatar not found" rather
-  than silently created here — avatar creation belongs to avatar setup
-  (Phase 5), not to a clothing endpoint.
+- Avatar resolution: avatars.user_id is UNIQUE (0-or-1 per user) and
+  registration creates the avatar in the same transaction as the user,
+  so a missing avatar is not a state this flow can produce anymore; if
+  it is ever seen anyway (e.g. a legacy row predating the backfill), it
+  is reported explicitly as 404 "Avatar not found" rather than silently
+  created here — avatar creation belongs to registration, not to a
+  clothing endpoint.
 - Replacement semantics: equipping into an occupied slot REPLACES the
   old item. The displaced item stays owned in user_wardrobe; nothing is
   charged and no ledger row is written — purchasing and equipping are
@@ -152,9 +154,11 @@ def equip_wardrobe_item(
             detail="Wardrobe item not found",
         )
 
-    # avatars.user_id is UNIQUE (0-or-1) and registration does NOT create
-    # one — a missing avatar is reported explicitly instead of being
-    # silently created here (avatar setup belongs to Phase 5).
+    # avatars.user_id is UNIQUE (0-or-1) and registration creates the
+    # avatar in the same transaction as the user, so this lookup should
+    # always resolve; if it ever doesn't (a legacy row predating the
+    # backfill), report it explicitly instead of silently creating an
+    # avatar inside a clothing endpoint.
     avatar_id = db.execute(
         select(Avatar.avatar_id).where(Avatar.user_id == current_user.user_id)
     ).scalar_one_or_none()

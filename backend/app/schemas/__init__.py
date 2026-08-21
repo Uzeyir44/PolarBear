@@ -20,6 +20,7 @@ from .wardrobe import (
     WardrobeEntryRead,
     WardrobeList,
 )
+from .avatar import AvatarEquipmentMap, AvatarRead, AvatarSlotEquipment
 
 __all__ = [
     "CoinBalance",
@@ -55,4 +56,7 @@ __all__ = [
     "EquipResult",
     "EquipmentRead",
     "UnequipResult",
+    "AvatarRead",
+    "AvatarSlotEquipment",
+    "AvatarEquipmentMap",
 ]

@@ -6,6 +6,11 @@ Run from the backend/ directory:
 
 Uses unique test user records and deletes them afterwards so the
 development database is left clean.
+
+Registration also creates the user's avatar in the SAME transaction
+(avatars.user_id is UNIQUE -> exactly one per user), so these checks
+verify that invariant directly against the database: exactly one avatar,
+linked to the new user, with server-generated id and created_at.
 """
 import time
 import warnings
@@ -22,7 +27,7 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.core.security import password_hasher
 from app.main import app
-from app.models import User
+from app.models import Avatar, User
 
 client = TestClient(app)
 
@@ -94,6 +99,28 @@ ok = (
     and password_hasher.verify(PASSWORD, hash_value)
 )
 results.append(("password stored as Argon2 hash (verifiable, not plaintext)", ok, str(hash_value)))
+
+# 2b. Registration created exactly one avatar for the new user, in the
+# same transaction — the one-avatar-per-user invariant.
+with SessionLocal() as db:
+    db_user = db.execute(select(User).where(User.username == USERNAME)).scalar_one_or_none()
+    avatars = (
+        db.execute(select(Avatar).where(Avatar.user_id == db_user.user_id)).scalars().all()
+        if db_user is not None
+        else []
+    )
+ok = (
+    db_user is not None
+    and len(avatars) == 1
+    and avatars[0].avatar_id is not None
+    and avatars[0].user_id == db_user.user_id
+    and avatars[0].created_at is not None
+)
+results.append(
+    ("registration created exactly one avatar (id + created_at set, linked to user)",
+     ok,
+     f"{len(avatars)} avatar(s), user_id={db_user.user_id if db_user else None}"),
+)
 
 # 3. Duplicate username rejected
 response = client.post(

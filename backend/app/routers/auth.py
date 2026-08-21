@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.jwt import create_access_token
 from app.core.security import hash_password, verify_password
-from app.models import User
+from app.models import Avatar, User
 from app.schemas.token import LoginRequest, Token
 from app.schemas.user import UserRead, UserRegister
 
@@ -51,8 +51,17 @@ def register(payload: UserRegister, db: Session = Depends(get_db)) -> User:
         password_hash=hash_password(payload.password),
     )
 
+    # Every registered user owns exactly one avatar (avatars.user_id is
+    # UNIQUE). The avatar is created in the SAME transaction as the user:
+    # one commit makes both permanent, and any failure rolls BOTH back —
+    # this flow can never leave a committed user without an avatar.
+    # Linking through the relationship (Avatar(user=user)) lets SQLAlchemy
+    # resolve the FK after the user INSERT; no id is generated client-side.
+    avatar = Avatar(user=user)
+
     try:
         db.add(user)
+        db.add(avatar)
         db.commit()
     except IntegrityError as exc:
         db.rollback()

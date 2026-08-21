@@ -11,9 +11,11 @@ Run from the backend/ directory:
 Covers:
   - Authentication: missing / invalid / expired token -> 401 on BOTH
     endpoints; an authenticated user gets through.
-  - Missing avatar: registration does NOT create an avatar, so a user
-    without one gets an explicit 404 "Avatar not found" (no silent
-    avatar creation inside a clothing endpoint).
+  - Missing avatar: only reachable for a LEGACY user whose avatar row
+    is absent (pre-backfill data, simulated here by deleting the row);
+    such a user gets an explicit 404 "Avatar not found" (no silent
+    avatar creation inside a clothing endpoint). Registration itself
+    creates the avatar, so newly registered users can equip right away.
   - Successful equip: one avatar_equipment row exists with the caller's
     avatar, the slot derived from clothing_categories, the owned item,
     and a server-written equipped_at.
@@ -112,7 +114,8 @@ def make_token(user_id: str, expires_delta: timedelta | None = None) -> str:
     return pyjwt.encode(payload, settings.secret_key, algorithm="HS256")
 
 
-def register_and_login(username: str, with_avatar: bool = True) -> tuple[uuid.UUID, dict]:
+def register_and_login(username: str) -> tuple[uuid.UUID, dict]:
+    """Register + login. Registration itself creates the user's avatar."""
     client.post(
         "/auth/register",
         json={"username": username, "email": f"{username}@example.com", "password": PASSWORD},
@@ -121,10 +124,17 @@ def register_and_login(username: str, with_avatar: bool = True) -> tuple[uuid.UU
     headers = {"Authorization": f"Bearer {login.json().get('access_token', '')}"}
     with SessionLocal() as db:
         user_id = db.execute(select(User.user_id).where(User.username == username)).scalar_one()
-        if with_avatar:
-            db.add(Avatar(user_id=user_id))
-            db.commit()
     return user_id, headers
+
+
+def delete_avatar(user_id: uuid.UUID) -> None:
+    """Simulate a LEGACY user (registered before the avatar lifecycle
+    existed / before the backfill) by removing their avatar row."""
+    with SessionLocal() as db:
+        avatar = db.execute(select(Avatar).where(Avatar.user_id == user_id)).scalar_one_or_none()
+        if avatar is not None:
+            db.delete(avatar)
+            db.commit()
 
 
 def add_category(slot: AvatarSlot) -> int:
@@ -231,13 +241,15 @@ created_item_ids: list[uuid.UUID] = []
 
 USER_A_NAME = f"eq_a_{RUN_ID}"
 USER_B_NAME = f"eq_b_{RUN_ID}"
-USER_C_NAME = f"eq_c_{RUN_ID}"  # registered WITHOUT an avatar
+USER_C_NAME = f"eq_c_{RUN_ID}"  # avatar deleted -> simulates a LEGACY user
 
 try:
     # --- Setup ---------------------------------------------------------------
-    USER_A, AUTH_A = register_and_login(USER_A_NAME, with_avatar=True)
-    USER_B, AUTH_B = register_and_login(USER_B_NAME, with_avatar=True)
-    USER_C, AUTH_C = register_and_login(USER_C_NAME, with_avatar=False)
+    # Registration itself now creates each user's avatar — no manual
+    # avatar inserts anywhere in this test.
+    USER_A, AUTH_A = register_and_login(USER_A_NAME)
+    USER_B, AUTH_B = register_and_login(USER_B_NAME)
+    USER_C, AUTH_C = register_and_login(USER_C_NAME)
 
     with SessionLocal() as db:
         AVATAR_A = db.execute(select(Avatar.avatar_id).where(Avatar.user_id == USER_A)).scalar_one()
@@ -267,12 +279,15 @@ try:
     expired = {"Authorization": f"Bearer {make_token(str(USER_A), timedelta(minutes=-5))}"}
     results.append(("equip with expired token -> 401", equip(W_A_TOP1, expired).status_code == 401, ""))
 
-    # --- 2. Missing avatar -> explicit 404 ---------------------------------------
-    # C owns an item (so the ownership check passes) but has NO avatar.
+    # --- 2. Missing avatar (legacy user) -> explicit 404 -------------------------
+    # C owns an item (so the ownership check passes) but their avatar row
+    # was removed to simulate a user registered before the avatar
+    # lifecycle / backfill existed.
+    delete_avatar(USER_C)
     W_C_ITEM = grant_ownership(USER_C, ITEM_IDS[AvatarSlot.ACCESSORY])
     r = equip(W_C_ITEM, AUTH_C)
     results.append(
-        ("user without avatar -> 404 'Avatar not found'",
+        ("legacy user without avatar -> 404 'Avatar not found'",
          r.status_code == 404 and r.json()["detail"] == "Avatar not found",
          f"{r.status_code} {r.json().get('detail')}"),
     )
