@@ -74,7 +74,8 @@ app/
 │   ├── product.py        # Product admin input/output schemas
 │   ├── user_admin.py     # User admin input/output schemas
 │   ├── clothing_admin.py # Clothing admin input/output schemas
-│   └── clothing.py       # ClothingItemRead / ClothingCategoryRef / ClothingItemList (output)
+│   ├── clothing.py       # ClothingItemRead / ClothingCategoryRef / ClothingItemList (output)
+│   └── wardrobe.py       # WardrobeEntryRead / WardrobeList (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
 │   ├── users.py          # /users/me, /users/me/coins, /users/me/transactions,
@@ -82,6 +83,8 @@ app/
 │   ├── qr.py             # POST /qr/redeem — Step 3: validate + redeem + award coins (protected)
 │   ├── clothing.py       # GET /clothing — browse the shop (authenticated, paginated,
 │   │                     # category filter, AVAILABLE-only)
+│   ├── wardrobe.py       # GET /wardrobe — the authenticated user's owned clothing
+│   │                     # (authenticated, paginated, newest-first)
 │   └── admin/            # Internal admin console (every route behind get_current_admin)
 │       ├── __init__.py   # /admin/me + mounts /admin/qr-codes, /admin/users,
 │       │                 # /admin/products and /admin/clothing
@@ -104,6 +107,7 @@ tests/                   # End-to-end test scripts (run with python -m tests.<na
 ├── test_admin_products.py# End-to-end admin product-management checks
 ├── test_clothing_browse.py # End-to-end GET /clothing browse checks
 ├── test_clothing_purchase.py # End-to-end POST /clothing/{item_id}/purchase checks
+├── test_wardrobe.py        # End-to-end GET /wardrobe owned-clothing checks
 └── test_admin_clothing.py  # End-to-end admin auth + clothing-management checks
 alembic/                  # Migrations (initial_schema, users.is_admin flag, clothing seed)
 ```
@@ -588,6 +592,56 @@ Error cases: missing/invalid/expired token → `401`; malformed uuid in the path
 
 No schema change was required for purchasing: `users.coin_balance`, `clothing_items.price`, `user_wardrobe`, `coin_transactions`, and the seeded `clothing_purchase` transaction type all already existed.
 
+## Wardrobe — owned clothing (`GET /wardrobe`)
+
+The first Phase 4 (wardrobe) endpoint: an authenticated user lists the clothing they own. Requires `Authorization: Bearer <token>`; without a valid token → `401`. Read-only — equipping/unequipping lives in `avatar_equipment` and is a later phase.
+
+Query parameters (the project's standard limit/offset pagination):
+
+| Parameter | Default | Constraints | Meaning |
+|-----------|---------|-------------|---------|
+| `limit`   | 20      | 1–100       | Entries per page |
+| `offset`  | 0       | ≥ 0         | Entries to skip |
+
+Response (`200 OK`) — the same `items/total/limit/offset` envelope as `GET /clothing`, where each entry is one `user_wardrobe` ownership record plus its item in the exact catalog shape (`ClothingItemRead`, nesting the category with its slot):
+
+```json
+{
+  "items": [
+    {
+      "wardrobe_id": "…",
+      "purchased_at": "2026-08-21T12:10:37.961346",
+      "item": {
+        "item_id": "…",
+        "name": "Polar Shades",
+        "description": "Classic aviator cut with UV400 protection.",
+        "category": { "category_id": 6, "category_name": "Sunglasses", "slot": "accessory" },
+        "price": 120,
+        "image_url": "https://mycolabear.example.com/clothing/sunglasses/polar-shades.png",
+        "availability_status": "available",
+        "collection_id": null
+      }
+    }
+  ],
+  "total": 1,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+Behavior and guarantees:
+
+- **Strict data isolation** — the owner comes ONLY from the JWT (`get_current_user()` → `current_user.user_id`) and is applied directly in the SQL `WHERE user_wardrobe.user_id = :jwt_user_id`. The endpoint declares no `user_id` path/query/body parameter, so there is no client input that could redirect the query at another user's rows; a smuggled `?user_id=…` query param is simply ignored by FastAPI.
+- **No availability filter** — unlike browsing, the wardrobe does NOT filter on `clothing_items.availability_status`. If an admin later marks an owned item `UNAVAILABLE`/`UPCOMING`, existing owners still see it: availability governs buying, not owning (this is what makes the admin rule "mark it UNAVAILABLE instead of deleting" safe).
+- **Deterministic ordering** — `purchased_at DESC` with `wardrobe_id DESC` as the tiebreaker (server-side `now()` can give two purchases committed together the same timestamp), so repeated requests paginate stably.
+- **No N+1** — each page loads its items with `joinedload(UserWardrobe.item).joinedload(ClothingItem.category)`: one query for the page plus one cheap `count(*)`.
+- **Empty wardrobe** — a user who never purchased gets `200` with `"items": []` and `"total": 0`; an empty closet is valid, never a `404`.
+- **Validation** — non-integer or out-of-range `limit`/`offset` → `422`.
+
+The payload is whitelisted by `WardrobeEntryRead`/`WardrobeList` (`app/schemas/wardrobe.py`) reusing `ClothingItemRead` from `app/schemas/clothing.py` — no email, password hash, auth-provider, balance, or other internal fields anywhere in the response.
+
+No schema change was required: the read runs over the existing `user_wardrobe`, `clothing_items`, and `clothing_categories` tables.
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -659,6 +713,12 @@ venv/Scripts/python -m tests.test_clothing_purchase
 # categories lookup, create/list/detail/update/delete, search + category +
 # availability filters, public browse/purchase compatibility, delete safety)
 venv/Scripts/python -m tests.test_admin_clothing
+
+# Wardrobe listing end-to-end (401s, empty wardrobe, real purchase surfaced,
+# newest-first ordering, limit/offset pagination + 422s, user isolation
+# between two users, owned UNAVAILABLE/UPCOMING items stay visible,
+# response field whitelists with no sensitive data)
+venv/Scripts/python -m tests.test_wardrobe
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -686,6 +746,8 @@ venv/Scripts/python -m tests.test_admin_clothing
 `test_clothing_purchase.py` verifies the purchase flow end-to-end: missing/invalid/expired token → `401`; a valid purchase → `200` with exactly the whitelisted response fields (`message`, `wardrobe_id`, `item` in the catalog shape, `amount_spent`, `remaining_balance`, `transaction_id`) and the row-level truth behind each field (a real `user_wardrobe` row, `coin_balance` debited by exactly the catalog price, one `coin_transactions` row with negative amount, type `clothing_purchase`, correct `balance_after`, correct `wardrobe_id` reference, `created_at` set); insufficient balance (including zero) → `400` with no wardrobe row, no ledger row, unchanged balance; `UNAVAILABLE` and `UPCOMING` items → `409` with no changes; nonexistent item → `404` and malformed uuid → `422` with no changes; buying the same item twice → first `200`, second `409`, charged once, single wardrobe + ledger row; a mid-transaction failure (the `clothing_purchase` lookup row temporarily renamed) rolls back the debit, the wardrobe insert, and the ledger together, then the lookup row is restored; two concurrent DB-layer purchases of two different 100-coin items with only 100 coins → exactly one `200`/one `400`, balance 0, never negative, one wardrobe + one ledger row; two concurrent DB-layer purchases of the same item → one `200`/one `409`, charged once; and the same guarantee through concurrent HTTP requests. The test creates its own category/items (RUN_ID-isolated) and cleans everything up afterward.
 
 `test_admin_clothing.py` verifies the clothing-management module: unauthenticated → `401` and normal users → `403` on every `/admin/clothing*` endpoint (list, categories, detail, create, update, delete) with an administrator granted; `GET /admin/clothing/categories` returns all seeded lookup rows (id/name/slot) ordered by id; `POST` returns `201` with database-generated `item_id`/`created_at`, defaults availability to `available`, trims whitespace, accepts `price = 0` but rejects negatives/non-integers with `422`, rejects unknown categories with `404`, blank names/image URLs with `422`, non-enum availabilities with `422`, and ignores client-supplied id/timestamp; `GET /admin/clothing` paginates newest-first (matching a direct DB query), tiles pages without overlap, searches name AND description case-insensitively with ILIKE escaping, filters by category (`404` on unknown) and by each availability value — including `UNAVAILABLE`/`UPCOMING`, which admins see although public browse hides them — and exposes exactly the whitelisted fields; `GET /{item_id}` returns the full view and `404` for a nonexistent item; `PATCH` updates every catalog field independently (including clearing description/collection with `null` and moving an item to another category, inheriting its slot), revalidates the category, keeps `item_id`/`created_at` immutable, and returns `404`/`422` as appropriate; public compatibility: an admin-created `AVAILABLE` item appears in `GET /clothing` and is purchasable, marking it `UNAVAILABLE` removes it from browse and makes purchase return `409`; delete safety: a wardrobe-referenced item → `409` with both the item and the ownership record intact, an unreferenced item → `204` and gone, nonexistent → `404`. All test data is cleaned up afterward.
+
+`test_wardrobe.py` verifies the wardrobe listing: missing/invalid/expired token → `401` and a valid token → `200`; a user who never purchased gets `200` with `"items": []` and `"total": 0`; one real purchase surfaces as exactly one entry whose `wardrobe_id`, `purchased_at`, and catalog-shaped `item` match the purchase response and the DB row; multiple entries come back newest-purchase-first (`purchased_at DESC`, `wardrobe_id DESC` tiebreak, verified against controlled timestamps) with repeated requests returning an identical order; `limit`/`offset` pagination tiles the wardrobe without overlap or gaps, empties past the end with `total` intact, accepts the maximum limit of 100, and rejects invalid values with `422`; user isolation — two users with disjoint wardrobes each see only their own items, and a smuggled `?user_id=…` query parameter is ignored entirely; availability independence — owned items flipped to `UNAVAILABLE`/`UPCOMING` remain visible in the wardrobe; and data safety — the envelope exposes only `items`/`total`/`limit`/`offset`, each entry only `wardrobe_id`/`purchased_at`/`item`, the nested item matches the public catalog shape, and no username/email/password/auth-provider/balance/admin fields appear anywhere in the payload. All test users, items, and categories are cleaned up afterward.
 
 ## Seed data
 
@@ -959,6 +1021,20 @@ WHERE t.user_id = '<alice_user_id>' AND tt.type_name = 'clothing_purchase';
 -- users.coin_balance equals the newest ledger row's balance_after:
 SELECT coin_balance FROM users WHERE user_id = '<alice_user_id>';
 ```
+
+### Wardrobe (Phase 4, part 1)
+
+Continuing from the purchase flow above (alice owns Polar Shades), with alice's token:
+
+| Request | Expected |
+| --- | --- |
+| `GET /wardrobe` | `200` with `items` containing one entry (`wardrobe_id`, `purchased_at`, the Polar Shades item in the catalog shape), `total: 1`, `limit: 20`, `offset: 0` |
+| `GET /wardrobe?limit=100&offset=0` | `200`, same entries, explicit pagination echoed back |
+| `GET /wardrobe?limit=0` / `limit=101` / `limit=-1` / `offset=-1` | `422` |
+| Any request without the `Authorization` header | `401` |
+| Log in as **bob** and call `GET /wardrobe` | `200` with `"items": []`, `"total": 0` — bob cannot see alice's purchases |
+
+There is no `user_id` parameter on this endpoint: the wardrobe is always the caller's own. A smuggled `?user_id=<alice_user_id>` on bob's request changes nothing.
 
 ### Complete follow flow (uses the test users above)
 

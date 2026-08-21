@@ -3,13 +3,14 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.routers import admin_router, auth_router, clothing_router, qr_router, users_router
+from app.routers import admin_router, auth_router, clothing_router, qr_router, users_router, wardrobe_router
 
 app = FastAPI()
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(qr_router)
 app.include_router(clothing_router)
+app.include_router(wardrobe_router)
 app.include_router(admin_router)
 
 
