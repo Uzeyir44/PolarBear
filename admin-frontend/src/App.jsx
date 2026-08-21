@@ -10,6 +10,8 @@ import UsersPage from './pages/UsersPage'
 import UserDetailPage from './pages/UserDetailPage'
 import ProductsPage from './pages/ProductsPage'
 import ProductDetailPage from './pages/ProductDetailPage'
+import ClothingPage from './pages/ClothingPage'
+import ClothingDetailPage from './pages/ClothingDetailPage'
 
 export default function App() {
   return (
@@ -33,6 +35,8 @@ export default function App() {
             <Route path="users/:userId" element={<UserDetailPage />} />
             <Route path="products" element={<ProductsPage />} />
             <Route path="products/:productId" element={<ProductDetailPage />} />
+            <Route path="clothing" element={<ClothingPage />} />
+            <Route path="clothing/:itemId" element={<ClothingDetailPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

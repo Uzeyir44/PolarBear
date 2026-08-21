@@ -9,6 +9,7 @@ export default function Layout() {
     { to: '/dashboard', label: 'Dashboard', end: true },
     { to: '/qr-codes', label: 'QR Codes', end: false },
     { to: '/products', label: 'Products', end: false },
+    { to: '/clothing', label: 'Clothing', end: false },
     { to: '/users', label: 'Users', end: false },
   ]
 

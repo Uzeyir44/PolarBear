@@ -369,6 +369,21 @@ a {
   color: #aeb6c2;
 }
 
+.pill-available {
+  background: rgba(39, 174, 96, 0.15);
+  color: var(--ok);
+}
+
+.pill-unavailable {
+  background: rgba(192, 57, 43, 0.15);
+  color: #e74c3c;
+}
+
+.pill-upcoming {
+  background: rgba(214, 137, 16, 0.15);
+  color: var(--warning);
+}
+
 /* ---------- User avatar ---------- */
 .avatar {
   display: inline-flex;
@@ -400,6 +415,11 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.table-thumb {
+  margin-right: 8px;
+  vertical-align: middle;
 }
 
 .search-field input {

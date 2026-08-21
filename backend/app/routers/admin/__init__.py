@@ -2,18 +2,18 @@
 Admin console router — public namespace for all internal management APIs.
 
 GET /admin/me reports the currently authenticated administrator's own
-identity. Module routers (Products, QR Codes and Users today; Clothing,
+identity. Module routers (Products, QR Codes, Users and Clothing today;
 Competitions, Notifications later) are sub-routers mounted under the same
-/admin prefix, so the admin surface grows without touching existing
-routes. get_current_admin() is enforced once at the package level via the
-router `dependencies` list — every endpoint beneath /admin inherits it.
+/admin prefix, so the admin surface grows without touching existing routes.
+get_current_admin() is enforced once at the package level via the router
+`dependencies` list — every endpoint beneath /admin inherits it.
 """
 from fastapi import APIRouter, Depends
 
 from app.dependencies import get_current_admin
 from app.models import User
 from app.schemas.admin import AdminUserRead
-from . import products, qr_codes, users
+from . import clothing, products, qr_codes, users
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(get_current_admin)])
 
@@ -26,3 +26,4 @@ def admin_me(current_admin: User = Depends(get_current_admin)) -> User:
 router.include_router(products.router, prefix="/products")
 router.include_router(qr_codes.router, prefix="/qr-codes")
 router.include_router(users.router, prefix="/users")
+router.include_router(clothing.router, prefix="/clothing")

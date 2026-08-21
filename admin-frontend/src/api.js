@@ -82,4 +82,19 @@ export const api = {
   getUser: (userId) => request(`/admin/users/${userId}`),
   updateUserStatus: (userId, isActive) =>
     request(`/admin/users/${userId}/status`, { method: 'PATCH', body: { is_active: isActive } }),
+  clothingCategories: () => request('/admin/clothing/categories'),
+  listClothing: (params) => {
+    const query = new URLSearchParams()
+    if (params.q) query.set('q', params.q)
+    if (params.categoryId) query.set('category_id', String(params.categoryId))
+    if (params.availability) query.set('availability', params.availability)
+    query.set('limit', String(params.limit || 20))
+    query.set('offset', String(params.offset || 0))
+    return request(`/admin/clothing?${query.toString()}`)
+  },
+  getClothing: (itemId) => request(`/admin/clothing/${itemId}`),
+  createClothing: (body) => request('/admin/clothing', { method: 'POST', body }),
+  updateClothing: (itemId, body) =>
+    request(`/admin/clothing/${itemId}`, { method: 'PATCH', body }),
+  deleteClothing: (itemId) => request(`/admin/clothing/${itemId}`, { method: 'DELETE' }),
 }

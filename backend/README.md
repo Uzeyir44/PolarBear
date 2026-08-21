@@ -73,6 +73,7 @@ app/
 │   ├── admin_qr.py       # QR admin input/output schemas
 │   ├── product.py        # Product admin input/output schemas
 │   ├── user_admin.py     # User admin input/output schemas
+│   ├── clothing_admin.py # Clothing admin input/output schemas
 │   └── clothing.py       # ClothingItemRead / ClothingCategoryRef / ClothingItemList (output)
 ├── routers/
 │   ├── auth.py           # POST /auth/register, POST /auth/login
@@ -82,9 +83,12 @@ app/
 │   ├── clothing.py       # GET /clothing — browse the shop (authenticated, paginated,
 │   │                     # category filter, AVAILABLE-only)
 │   └── admin/            # Internal admin console (every route behind get_current_admin)
-│       ├── __init__.py   # /admin/me + mounts /admin/qr-codes and /admin/users
+│       ├── __init__.py   # /admin/me + mounts /admin/qr-codes, /admin/users,
+│       │                 # /admin/products and /admin/clothing
 │       ├── qr_codes.py   # /admin/qr-codes CRUD + status management, /admin/.../products
-│       └── users.py      # /admin/users list/detail/activate-deactivate
+│       ├── users.py      # /admin/users list/detail/activate-deactivate
+│       ├── products.py   # /admin/products CRUD with guarded delete
+│       └── clothing.py   # /admin/clothing CRUD + categories lookup, guarded delete
 tests/                   # End-to-end test scripts (run with python -m tests.<name>)
 ├── test_db.py            # Manual DB connectivity check
 ├── test_register.py      # End-to-end registration checks
@@ -99,7 +103,8 @@ tests/                   # End-to-end test scripts (run with python -m tests.<na
 ├── test_admin_users.py   # End-to-end admin auth + user management checks
 ├── test_admin_products.py# End-to-end admin product-management checks
 ├── test_clothing_browse.py # End-to-end GET /clothing browse checks
-└── test_clothing_purchase.py # End-to-end POST /clothing/{item_id}/purchase checks
+├── test_clothing_purchase.py # End-to-end POST /clothing/{item_id}/purchase checks
+└── test_admin_clothing.py  # End-to-end admin auth + clothing-management checks
 alembic/                  # Migrations (initial_schema, users.is_admin flag, clothing seed)
 ```
 
@@ -649,6 +654,11 @@ venv/Scripts/python -m tests.test_clothing_browse
 # nonexistent item, duplicate purchase, mid-transaction rollback, DB-layer
 # and HTTP-layer concurrency races)
 venv/Scripts/python -m tests.test_clothing_purchase
+
+# Admin clothing management end-to-end (401/403/granted on every endpoint,
+# categories lookup, create/list/detail/update/delete, search + category +
+# availability filters, public browse/purchase compatibility, delete safety)
+venv/Scripts/python -m tests.test_admin_clothing
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -674,6 +684,8 @@ venv/Scripts/python -m tests.test_clothing_purchase
 `test_clothing_browse.py` verifies the shop browsing surface: missing/invalid/expired token → `401` on `GET /clothing` and a valid token → `200`; unfiltered listing returns only the whitelisted item fields (`item_id`, `name`, `description`, `category` → `category_id`/`category_name`/`slot`, `price`, `image_url`, `availability_status`, `collection_id`); ordering is deterministic (`created_at DESC`, `item_id DESC` tiebreak) — a repeated request is identical and matches a direct DB query; `limit`/`offset` pagination tiles the result set with no overlap and empties past the end with a correct `total`; filtering by a real category id returns only that category's items; a category with no AVAILABLE items returns `total: 0`; the AVAILABLE-only rule hides `UNAVAILABLE` and `UPCOMING` items; a nonexistent in-range `category_id` → `404`; non-integer/out-of-range/zero/negative `category_id` and invalid `limit`/`offset` → `422`; `collection_id` round-trips when set and is `null` otherwise; and `availability_status` serializes to `"available"`. The test creates its own categories/items (RUN_ID-isolated) and cleans everything up afterward.
 
 `test_clothing_purchase.py` verifies the purchase flow end-to-end: missing/invalid/expired token → `401`; a valid purchase → `200` with exactly the whitelisted response fields (`message`, `wardrobe_id`, `item` in the catalog shape, `amount_spent`, `remaining_balance`, `transaction_id`) and the row-level truth behind each field (a real `user_wardrobe` row, `coin_balance` debited by exactly the catalog price, one `coin_transactions` row with negative amount, type `clothing_purchase`, correct `balance_after`, correct `wardrobe_id` reference, `created_at` set); insufficient balance (including zero) → `400` with no wardrobe row, no ledger row, unchanged balance; `UNAVAILABLE` and `UPCOMING` items → `409` with no changes; nonexistent item → `404` and malformed uuid → `422` with no changes; buying the same item twice → first `200`, second `409`, charged once, single wardrobe + ledger row; a mid-transaction failure (the `clothing_purchase` lookup row temporarily renamed) rolls back the debit, the wardrobe insert, and the ledger together, then the lookup row is restored; two concurrent DB-layer purchases of two different 100-coin items with only 100 coins → exactly one `200`/one `400`, balance 0, never negative, one wardrobe + one ledger row; two concurrent DB-layer purchases of the same item → one `200`/one `409`, charged once; and the same guarantee through concurrent HTTP requests. The test creates its own category/items (RUN_ID-isolated) and cleans everything up afterward.
+
+`test_admin_clothing.py` verifies the clothing-management module: unauthenticated → `401` and normal users → `403` on every `/admin/clothing*` endpoint (list, categories, detail, create, update, delete) with an administrator granted; `GET /admin/clothing/categories` returns all seeded lookup rows (id/name/slot) ordered by id; `POST` returns `201` with database-generated `item_id`/`created_at`, defaults availability to `available`, trims whitespace, accepts `price = 0` but rejects negatives/non-integers with `422`, rejects unknown categories with `404`, blank names/image URLs with `422`, non-enum availabilities with `422`, and ignores client-supplied id/timestamp; `GET /admin/clothing` paginates newest-first (matching a direct DB query), tiles pages without overlap, searches name AND description case-insensitively with ILIKE escaping, filters by category (`404` on unknown) and by each availability value — including `UNAVAILABLE`/`UPCOMING`, which admins see although public browse hides them — and exposes exactly the whitelisted fields; `GET /{item_id}` returns the full view and `404` for a nonexistent item; `PATCH` updates every catalog field independently (including clearing description/collection with `null` and moving an item to another category, inheriting its slot), revalidates the category, keeps `item_id`/`created_at` immutable, and returns `404`/`422` as appropriate; public compatibility: an admin-created `AVAILABLE` item appears in `GET /clothing` and is purchasable, marking it `UNAVAILABLE` removes it from browse and makes purchase return `409`; delete safety: a wardrobe-referenced item → `409` with both the item and the ownership record intact, an unreferenced item → `204` and gone, nonexistent → `404`. All test data is cleaned up afterward.
 
 ## Seed data
 
@@ -781,12 +793,22 @@ UPDATE users SET is_admin = true WHERE username = '<your-admin-username>';
 | `GET` | `/admin/users` | Paginated user list, newest first; `q` (username/email) search and `is_active` filter |
 | `GET` | `/admin/users/{user_id}` | Safe administrative detail for one user |
 | `PATCH` | `/admin/users/{user_id}/status` | Deactivate (`{"is_active": false}`) or reactivate a user |
+| `GET` | `/admin/clothing/categories` | The `clothing_categories` lookup rows (id/name/slot) for the admin form's category dropdown |
+| `GET` | `/admin/clothing` | Paginated catalog list, newest first, **all** availability statuses; `q` (name/description) search, `category_id` and `availability` filters |
+| `GET` | `/admin/clothing/{item_id}` | Full administrative detail for one item |
+| `POST` | `/admin/clothing` | Create an item (`name`, `description`, `category_id`, `price`, `image_url`, optional `availability_status`/`collection_id`) — `201`; category must exist (`404`), price ≥ 0, availability defaults to `available` |
+| `PATCH` | `/admin/clothing/{item_id}` | Update any catalog field (single-field PATCH); revalidates the category; `item_id`/`created_at` are immutable |
+| `DELETE` | `/admin/clothing/{item_id}` | Delete an **unreferenced** item; `409` if any user owns/wears it — mark it `UNAVAILABLE` instead |
 
 Status rules are enforced on the server: only `ACTIVE ⇄ EXPIRED` transitions are allowed; `REDEEMED` codes are immutable (they are audit history) and `ACTIVE → REDEEMED` is rejected with `409`. Users are never deleted — toggling `is_active` is the only administrative mutation, and an administrator cannot deactivate their own account (`400`). Products are edited in place (`name`/`sku`); `product_id` and `created_at` are database-owned, and a product referenced by QR codes cannot be deleted (the `RESTRICT` FK would break audit history, so the API returns `409`).
 
+Clothing is managed on the **same** `clothing_items` table the public shop browses/purchases from — there is no second catalog. The slot is never client-supplied: it is inherited from the selected `clothing_categories` row. Deletion mirrors the products rule but stricter: `user_wardrobe.item_id` and `avatar_equipment.item_id` are both `RESTRICT` FKs and ownership/equipment rows are historical records, so an item with any wardrobe or equipment reference returns `409` ("…Mark it UNAVAILABLE instead."). Removing an item from the shop is done by editing its availability to `unavailable`, which hides it from browsing and blocks purchases while preserving every user's ownership history. No soft-delete column was needed — the existing `availability_status` provides exactly that behavior.
+
 ### Admin frontend
 
-Pages: `/login` (admin sign-in; an authenticated non-admin is refused), `/dashboard`, `/qr-codes` (list with filters, pagination, refresh, create modal, deactivate/reactivate with confirmation), `/qr-codes/:id` (details + status actions), `/products` (searchable table with create/edit/delete, QR-reference states), `/products/:id` (details + edit + guarded delete), `/users` (search/filter table), `/users/:id` (details + status actions). A normal user's token never grants access — the UI hides nothing, the backend enforces everything.
+Pages: `/login` (admin sign-in; an authenticated non-admin is refused), `/dashboard`, `/qr-codes` (list with filters, pagination, refresh, create modal, deactivate/reactivate with confirmation), `/qr-codes/:id` (details + status actions), `/products` (searchable table with create/edit/delete, QR-reference states), `/products/:id` (details + edit + guarded delete), `/clothing` (searchable/filterable catalog table with create/edit/delete), `/clothing/:id` (details + edit + guarded delete), `/users` (search/filter table), `/users/:id` (details + status actions). A normal user's token never grants access — the UI hides nothing, the backend enforces everything.
+
+The Clothing page's category dropdown is populated from `GET /admin/clothing/categories` — the administrator picks a named category (the form shows which avatar slot it equips into) and the actual `category_id` is sent; no manual ids, and the slot is never editable. The availability dropdown offers exactly the three existing enum values.
 
 ### Manual QR workflow test
 
@@ -826,6 +848,20 @@ See `test_admin_users.py` for the automated coverage of all of the above.
 9. Create a second, unreferenced product → its **Delete** button is enabled → delete it with confirmation → the row disappears.
 
 See `test_admin_products.py` for the automated coverage of all of the above.
+
+### Manual clothing-management workflow test
+
+1. With the panel open as an administrator, click **Clothing** in the sidebar.
+2. See the catalog table (thumbnail, name, category, slot, price, availability pill, created) — the seeded items from **Seed data** are all there, including `UNAVAILABLE`/`UPCOMING` ones that the public shop hides.
+3. Type in the search box → the list narrows to matching names/descriptions; use the **Category** and **Availability** dropdowns to filter.
+4. Click **New clothing** → pick a category from the dropdown (populated by the backend; it shows the avatar slot), enter a name, price, image URL → **Create clothing** → the row appears with an `available` pill.
+5. Click **View** on the item → the detail page shows every field including `item_id`, collection id and created date.
+6. Click **Edit clothing** → change the price and set availability to **Unavailable** → **Save changes** → the detail page reflects both.
+7. Log in as a normal user (or use their token): `GET /clothing` no longer lists the item, and `POST /clothing/{item_id}/purchase` returns `409` — the item is off the shelf without being destroyed.
+8. Edit the item back to **Available** → a user can browse and buy it again.
+9. Try **Delete** on an item a user has purchased → the backend refuses with `409` ("…Mark it UNAVAILABLE instead") and the ownership record survives; delete a never-purchased item → `204` and it disappears.
+
+See `test_admin_clothing.py` for the automated coverage of all of the above.
 
 ## Test users
 
