@@ -60,3 +60,22 @@ class ClothingItemList(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class ClothingPurchaseResult(BaseModel):
+    """Response of POST /clothing/{item_id}/purchase.
+
+    Everything a client needs to confirm a purchase in one payload:
+    the bought item (same shape as the catalog view), the user_wardrobe
+    ownership record id, how many coins the purchase cost (positive
+    number — the debit sign lives in the ledger, not here), the
+    remaining coin_balance after the debit, and the coin_transactions
+    ledger row id that recorded it.
+    """
+
+    message: str
+    wardrobe_id: uuid.UUID
+    item: ClothingItemRead
+    amount_spent: int
+    remaining_balance: int
+    transaction_id: uuid.UUID

@@ -12,7 +12,7 @@ from .admin_qr import (
 )
 from .user_admin import UserAdminList, UserAdminRead, UserAdminStatusUpdate
 from .product import ProductAdminCreate, ProductAdminList, ProductAdminRead, ProductAdminUpdate
-from .clothing import ClothingCategoryRef, ClothingItemList, ClothingItemRead
+from .clothing import ClothingCategoryRef, ClothingItemList, ClothingItemRead, ClothingPurchaseResult
 
 __all__ = [
     "CoinBalance",
@@ -42,4 +42,5 @@ __all__ = [
     "ClothingCategoryRef",
     "ClothingItemList",
     "ClothingItemRead",
+    "ClothingPurchaseResult",
 ]

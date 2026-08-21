@@ -98,7 +98,8 @@ tests/                   # End-to-end test scripts (run with python -m tests.<na
 ├── test_admin_qr.py      # End-to-end admin auth + QR management checks
 ├── test_admin_users.py   # End-to-end admin auth + user management checks
 ├── test_admin_products.py# End-to-end admin product-management checks
-└── test_clothing_browse.py # End-to-end GET /clothing browse checks
+├── test_clothing_browse.py # End-to-end GET /clothing browse checks
+└── test_clothing_purchase.py # End-to-end POST /clothing/{item_id}/purchase checks
 alembic/                  # Migrations (initial_schema, users.is_admin flag, clothing seed)
 ```
 
@@ -539,6 +540,49 @@ The response is whitelisted by `ClothingItemRead` (`app/schemas/clothing.py`): o
 
 **Ordering / performance.** Results are deterministic: `ORDER BY created_at DESC, item_id DESC`, so repeated requests over the same data paginate stably. The category context is loaded in the same query (`joinedload`), so there is no N+1. No schema change was required: both `clothing_items` and `clothing_categories` already existed; the catalog entries (see **Seed data** below) were added by a data-only migration (`e833bac26dfc`).
 
+## Clothing shop — purchase (`POST /clothing/{item_id}/purchase`)
+
+The second Phase 3 (clothing shop) endpoint: an authenticated user buys one catalog item. Requires `Authorization: Bearer <token>`; without a valid token → `401`. There is **no request body** — the item comes from the URL path, and everything else (price, ledger amount, balance) is read from the database, so a client can never under-report what it pays.
+
+One purchase = one atomic transaction that either commits completely or not at all:
+
+1. **Lock the buyer's row** (`SELECT … FOR UPDATE` on `users`) — serializes all of a user's concurrent debits.
+2. **Validate the item** — must exist (`404`) and be `AVAILABLE`; `UNAVAILABLE`/`UPCOMING` items are rejected with `409`.
+3. **Ownership check** — already owning the item → `409` (the `uq_user_wardrobe_no_duplicate_purchase` unique constraint remains the final race protection; an `IntegrityError` from it is caught and reported as the same `409`).
+4. **Balance check** — `coin_balance < price` → `400`, nothing is written.
+5. **Debit** — atomic guarded `UPDATE users SET coin_balance = coin_balance - :price … WHERE coin_balance >= :price RETURNING coin_balance` (the same pattern QR redemption uses; it cannot produce a negative balance or a lost update even without the lock).
+6. **Wardrobe insert** — permanent ownership row in `user_wardrobe`.
+7. **Ledger insert** — one `coin_transactions` row with type `clothing_purchase` (the seeded DEBIT lookup row), `amount = -price`, `balance_after` = the post-debit balance, and `wardrobe_id` pointing at the new ownership record.
+8. **COMMIT** — all writes land together; any failure before commit rolls all of them back.
+
+Response (`200 OK`):
+
+```json
+{
+  "message": "Item purchased successfully",
+  "wardrobe_id": "…",
+  "item": {
+    "item_id": "…",
+    "name": "Polar Shades",
+    "description": "Classic aviator cut with UV400 protection.",
+    "category": { "category_id": 6, "category_name": "Sunglasses", "slot": "accessory" },
+    "price": 120,
+    "image_url": "https://mycolabear.example.com/clothing/sunglasses/polar-shades.png",
+    "availability_status": "available",
+    "collection_id": null
+  },
+  "amount_spent": 120,
+  "remaining_balance": 380,
+  "transaction_id": "…"
+}
+```
+
+`amount_spent` is a positive number (the debit sign lives in the ledger); `remaining_balance` mirrors `users.coin_balance` after the debit; `transaction_id` is the `coin_transactions` ledger row. The payload is whitelisted by `ClothingPurchaseResult` (`app/schemas/clothing.py`) and reuses the catalog shape for the purchased item — no internal fields, no auth data.
+
+Error cases: missing/invalid/expired token → `401`; malformed uuid in the path → `422`; nonexistent item → `404`; `UNAVAILABLE`/`UPCOMING` item → `409`; already owned → `409`; insufficient coins → `400` (with no database change). A mid-transaction failure (e.g. the lookup row unresolvable) rolls back the debit, the wardrobe insert, and the ledger together — partial state is impossible.
+
+No schema change was required for purchasing: `users.coin_balance`, `clothing_items.price`, `user_wardrobe`, `coin_transactions`, and the seeded `clothing_purchase` transaction type all already existed.
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -599,6 +643,12 @@ venv/Scripts/python -m tests.test_admin_users
 # Clothing browse end-to-end (401s, 200s, AVAILABLE-only rule, category
 # filter/404/422s, deterministic ordering, pagination, response whitelist)
 venv/Scripts/python -m tests.test_clothing_browse
+
+# Clothing purchase end-to-end (401s, successful purchase with wardrobe +
+# ledger + balance checks, insufficient balance, unavailable/upcoming,
+# nonexistent item, duplicate purchase, mid-transaction rollback, DB-layer
+# and HTTP-layer concurrency races)
+venv/Scripts/python -m tests.test_clothing_purchase
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -622,6 +672,8 @@ venv/Scripts/python -m tests.test_clothing_browse
 `test_admin_products.py` verifies the product-management module: unauthenticated → `401` and normal users → `403` on every `/admin/products` endpoint (list, detail, create, update, delete) with an administrator granted; `GET /admin/products` paginates newest-first with `total`/`limit`/`offset`, supports case-insensitive, ILIKE-escaped name/SKU search, and exposes only `product_id`/`name`/`sku`/`created_at`/`qr_code_count`; `GET /admin/products/{product_id}` returns the full safe view (with `qr_code_count`) and `404` for a nonexistent product; `POST` returns `201` with a database-generated `product_id`/`created_at`, trims whitespace, rejects a duplicate SKU with `409` and blank fields with `422`, and ignores client-supplied id/timestamp; `PATCH` updates name and/or SKU, cannot change `product_id`/`created_at`, rejects a SKU already in use by another product with `409`, and returns `404`/`422` as appropriate; `DELETE` removes an unreferenced product (`204`) but refuses a product referenced by QR codes with `409`, leaving the row and its audit history untouched; and a QR created against a product is reflected in `qr_code_count` and blocks deletion. All test data is cleaned up afterward.
 
 `test_clothing_browse.py` verifies the shop browsing surface: missing/invalid/expired token → `401` on `GET /clothing` and a valid token → `200`; unfiltered listing returns only the whitelisted item fields (`item_id`, `name`, `description`, `category` → `category_id`/`category_name`/`slot`, `price`, `image_url`, `availability_status`, `collection_id`); ordering is deterministic (`created_at DESC`, `item_id DESC` tiebreak) — a repeated request is identical and matches a direct DB query; `limit`/`offset` pagination tiles the result set with no overlap and empties past the end with a correct `total`; filtering by a real category id returns only that category's items; a category with no AVAILABLE items returns `total: 0`; the AVAILABLE-only rule hides `UNAVAILABLE` and `UPCOMING` items; a nonexistent in-range `category_id` → `404`; non-integer/out-of-range/zero/negative `category_id` and invalid `limit`/`offset` → `422`; `collection_id` round-trips when set and is `null` otherwise; and `availability_status` serializes to `"available"`. The test creates its own categories/items (RUN_ID-isolated) and cleans everything up afterward.
+
+`test_clothing_purchase.py` verifies the purchase flow end-to-end: missing/invalid/expired token → `401`; a valid purchase → `200` with exactly the whitelisted response fields (`message`, `wardrobe_id`, `item` in the catalog shape, `amount_spent`, `remaining_balance`, `transaction_id`) and the row-level truth behind each field (a real `user_wardrobe` row, `coin_balance` debited by exactly the catalog price, one `coin_transactions` row with negative amount, type `clothing_purchase`, correct `balance_after`, correct `wardrobe_id` reference, `created_at` set); insufficient balance (including zero) → `400` with no wardrobe row, no ledger row, unchanged balance; `UNAVAILABLE` and `UPCOMING` items → `409` with no changes; nonexistent item → `404` and malformed uuid → `422` with no changes; buying the same item twice → first `200`, second `409`, charged once, single wardrobe + ledger row; a mid-transaction failure (the `clothing_purchase` lookup row temporarily renamed) rolls back the debit, the wardrobe insert, and the ledger together, then the lookup row is restored; two concurrent DB-layer purchases of two different 100-coin items with only 100 coins → exactly one `200`/one `400`, balance 0, never negative, one wardrobe + one ledger row; two concurrent DB-layer purchases of the same item → one `200`/one `409`, charged once; and the same guarantee through concurrent HTTP requests. The test creates its own category/items (RUN_ID-isolated) and cleans everything up afterward.
 
 ## Seed data
 
@@ -826,6 +878,50 @@ Verify in the database:
 
 ```sql
 SELECT name, category_id, price, availability_status FROM clothing_items ORDER BY created_at, item_id;
+```
+
+### Clothing purchase (Phase 3)
+
+Purchases spend real coins, so first give your test user a balance directly in the DB (there is no endpoint that mints coins yet):
+
+```sql
+UPDATE users SET coin_balance = 1000 WHERE username = 'alice';
+```
+
+Then, with alice's token:
+
+| Request | Expected |
+| --- | --- |
+| `POST /clothing/{item_id}/purchase` (a seeded AVAILABLE item, e.g. Polar Shades) | `200` with `message`, `wardrobe_id`, `item`, `amount_spent: 120`, `remaining_balance: 880`, `transaction_id` |
+| Same request again | `409` ("You already own this clothing item") |
+| `POST /clothing/{item_id}/purchase` for Winter Toque Deluxe (`UNAVAILABLE`) | `409` ("not available for purchase") |
+| `POST /clothing/{item_id}/purchase` for Neon Faux Hawk (`UPCOMING`) | `409` ("not available for purchase") |
+| `POST /clothing/{random-uuid}/purchase` | `404` |
+| `POST /clothing/not-a-uuid/purchase` | `422` |
+| Any purchase without the `Authorization` header | `401` |
+
+To see an insufficient-balance rejection, drop alice's balance below an item's price and retry:
+
+```sql
+UPDATE users SET coin_balance = 50 WHERE username = 'alice';
+-- POST /clothing/{polar_hoodie_id}/purchase -> 400 "Insufficient coin balance"
+```
+
+Verify in the database after a successful buy:
+
+```sql
+-- Ownership row exists:
+SELECT * FROM user_wardrobe WHERE user_id = '<alice_user_id>';
+
+-- Exactly one DEBIT ledger row per purchase, consistent with the balance:
+SELECT t.amount, t.balance_after, t.type_name, w.wardrobe_id
+FROM coin_transactions t
+JOIN coin_transaction_types tt ON tt.type_id = t.type_id
+JOIN user_wardrobe w ON w.wardrobe_id = t.wardrobe_id
+WHERE t.user_id = '<alice_user_id>' AND tt.type_name = 'clothing_purchase';
+
+-- users.coin_balance equals the newest ledger row's balance_after:
+SELECT coin_balance FROM users WHERE user_id = '<alice_user_id>';
 ```
 
 ### Complete follow flow (uses the test users above)
