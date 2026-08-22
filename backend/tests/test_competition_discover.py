@@ -197,9 +197,11 @@ try:
         and body["limit"] == 20
         and body["offset"] == 0
         and comp1_id in item_ids and comp4_id in item_ids
-        and visible_test == sorted([comp1_id, comp4_id])   # exactly the two others-users comps
+        and visible_test == sorted([comp1_id, comp4_id])
         and all(i["status"] == "active" for i in body["items"])
-        and all(i["total_votes"] == 0 for i in body["items"])
+        # Pre-existing competitions in the shared dev DB may legitimately have
+        # votes; the feed's own fresh test competitions always start at 0.
+        and all(i["total_votes"] == 0 for i in body["items"] if i["competition_id"] in test_ids)
         and all(
             i["challenger"]["user_id"] != IDS["C"] and i["opponent"]["user_id"] != IDS["C"]
             for i in body["items"]

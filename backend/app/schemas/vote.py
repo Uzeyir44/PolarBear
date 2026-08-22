@@ -1,10 +1,11 @@
 """
-Pydantic schemas for votes — Phase 6, Part 4B-1 (basic vote casting).
+Pydantic schemas for votes — Phase 6, Part 4B (vote casting with cost).
 
 VoteCreate is the ONLY field the client supplies (who they vote for);
 competition_id, voter_id, and created_at are owned by the backend. VoteRead
-is the safe confirmation response — ids + timestamp + the fresh total_votes;
-no password/account/coin fields.
+is the safe confirmation response — ids + timestamp + the fresh total_votes
+and the voter's balance_after (mirroring how QR redemption returns the new
+balance). No password/account/coin-history fields.
 """
 from datetime import datetime
 from uuid import UUID
@@ -23,3 +24,4 @@ class VoteRead(BaseModel):
     voted_for_user_id: UUID
     created_at: datetime
     total_votes: int
+    balance_after: int

@@ -1,5 +1,5 @@
 """
-End-to-end checks of basic vote casting — Phase 6, Part 4B-1:
+End-to-end checks of basic vote casting mechanics — Phase 6, Part 4B:
 
   * a third-party user can vote for either participant (challenger/opponent)
   * self-voting is impossible (challenger and opponent -> 400)
@@ -9,8 +9,8 @@ End-to-end checks of basic vote casting — Phase 6, Part 4B-1:
     constraint), and a duplicate never increases total_votes
   * concurrent duplicate votes from one voter -> exactly one 201 + one 409
   * the vote row and the total_votes increment commit atomically
-  * THIS STAGE IS FREE: coin_balance is never modified and no
-    coin_transactions row is created
+  * voting now costs 1 coin (Part 4B-2) — voters are given a starting coin;
+    the deep coin/ledger coverage lives in tests.test_vote_cost
 
 Run from the backend/ directory:
     venv/Scripts/python -m tests.test_vote_casting
@@ -65,6 +65,13 @@ def cleanup() -> None:
                     select(Competition).where(Competition.request_id.in_(req_ids))
                 ).scalars().all()
             comp_ids = [c.competition_id for c in comps]
+            # coin_transactions' FKs (user_id, vote_id, competition_id) are all
+            # ondelete RESTRICT — the ledger rows must go first.
+            if ids:
+                for tx in db.execute(
+                    select(CoinTransaction).where(CoinTransaction.user_id.in_(ids))
+                ).scalars().all():
+                    db.delete(tx)
             if comp_ids:
                 for v in db.execute(
                     select(Vote).where(Vote.competition_id.in_(comp_ids))
@@ -145,6 +152,14 @@ def mark_completed(competition_id: str) -> None:
         db.commit()
 
 
+def credit(username: str, amount: int) -> None:
+    """Give a test user a starting coin_balance (voting now costs 1 coin)."""
+    with SessionLocal() as db:
+        user = db.execute(select(User).where(User.username == username)).scalar_one()
+        user.coin_balance = amount
+        db.commit()
+
+
 results = []
 
 # --- Setup ---------------------------------------------------------------
@@ -155,6 +170,11 @@ IDS = {}
 with SessionLocal() as db:
     for n in USERS:
         IDS[n] = str(db.execute(select(User.user_id).where(User.username == USERS[n])).scalar_one())
+
+# Voting now costs 1 coin (Part 4B-2): the successful voters need a starting coin.
+credit(USERS["C"], 1)
+credit(USERS["D"], 1)
+credit(USERS["E"], 1)
 
 try:
     # Competition A (challenger) vs B (opponent), ACTIVE.
@@ -195,14 +215,12 @@ try:
     results.append(("third-party user can vote for opponent -> 201, total_votes = 2", ok, str(r.status_code)))
     results.append(("total_votes stored +1 per successful vote", total_votes(comp_id) == 2, str(total_votes(comp_id))))
 
-    # --- 14,15. Coin safety (voting is FREE in this stage) ----------------------------------
+    # --- 14. Voters now spend their single coin (deep ledger coverage in test_vote_cost) ------
     balances = coin_balances()
-    ok = (
-        all(b == 0 for b in balances.values())
-        and coin_transaction_count() == 0
-    )
-    results.append(("votes did NOT modify any user's coin_balance", ok, str(balances)))
-    results.append(("votes did NOT create any coin_transactions row", coin_transaction_count() == 0, ""))
+    results.append(("each successful vote spent the voter's single coin (C/D now 0)",
+                    balances[USERS["C"]] == 0 and balances[USERS["D"]] == 0, str(balances)))
+    results.append(("each successful vote created one vote_cast coin_transactions row (2 total)",
+                    coin_transaction_count() == 2, str(coin_transaction_count())))
 
     # --- 6. Unauthenticated -> 401 ------------------------------------------------------------
     r = client.post(f"/competitions/{comp_id}/votes", json={"voted_for_user_id": IDS["A"]})

@@ -1065,13 +1065,11 @@ Response (`200 OK`) — an envelope in the same style as the wardrobe/clothing f
 
 Only the aggregate `total_votes` is exposed — no per-participant vote counts and no voter identities. Both participants are the four-field `UserPublic` shape; `email`, `password_hash`, `coin_balance`, `is_active`, auth-provider and device-token data never appear.
 
-Errors: missing/invalid/expired token → `401`; invalid `limit`/`offset` → `422`. Unlike `GET /competitions` and `GET /competitions/{id}` (which are participant-scoped), discovery is a public, authenticated view of OTHER users' competitions. Voting is implemented (see below) — voting is currently **FREE**.
+Errors: missing/invalid/expired token → `401`; invalid `limit`/`offset` → `422`. Unlike `GET /competitions` and `GET /competitions/{id}` (which are participant-scoped), discovery is a public, authenticated view of OTHER users' competitions. Voting is implemented (see below) — a vote costs **1 coin**.
 
 ### Cast a vote (`POST /competitions/{competition_id}/votes`)
 
-Lets the authenticated user vote in an **ACTIVE** competition they are **not** a participant of. Response is a confirmation with the fresh `total_votes`. Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`.
-
-**Current version: voting itself is implemented, but voting is currently FREE.** No coins are deducted, no `coin_transactions` row is written, and `users.coin_balance` is never touched. The next feature (Part 4B-2) will introduce **1 vote = 1 coin**.
+Lets the authenticated user vote in an **ACTIVE** competition they are **not** a participant of, at a fixed cost of **1 coin**. Response is a confirmation with the fresh `total_votes` and the voter's resulting balance. Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`.
 
 Request body (`VoteCreate`):
 
@@ -1088,9 +1086,28 @@ Rules (all enforced from the JWT identity, never the frontend):
 - **Self-voting is impossible**: a participant (challenger **or** opponent) → `400` "You cannot vote in your own competition". A can never vote for B in the A-vs-B competition.
 - `voted_for_user_id` must be one of the two participants (challenger or opponent) → else `400` "You can only vote for a participant of this competition".
 - **One vote per user per competition**: enforced by `UNIQUE(competition_id, voter_id)` — a second `POST` from the same voter → `409` "You have already voted in this competition". Votes are immutable (no switching, no deleting — a second vote is simply rejected).
+- **Insufficient balance → `400` "Not enough coins to vote"**: the voter must have at least 1 coin; if not, nothing changes (no vote, no deduction, no ledger row, no count change).
 - Invalid `competition_id` or `voted_for_user_id` (bad UUID) → normal Pydantic `422`.
 
-Atomicity & concurrency: the `votes` INSERT and the `total_votes` increment are one transaction — the count only moves if the vote row is created, and vice-versa. `total_votes` is bumped with a single atomic `UPDATE competitions SET total_votes = total_votes + 1` (never a Python read-modify-write), so simultaneous votes from different users each count exactly once; simultaneous duplicate votes from the same user are serialized by the UNIQUE constraint — exactly one succeeds, the loser rolls back and gets `409`. Vote target validity is additionally back-stopped by a `votes` trigger in the model (installed only on table creation; a fresh-database constraint violation surfaces as the same `400`).
+A successful vote performs ONE atomic business operation — vote, coin deduction, ledger row, and count all commit (or roll back) together:
+
+```
+BEGIN
+  validations                          (exists / active / not-a-participant / target)
+  INSERT votes                         (UNIQUE gate — duplicate => 409, rolls back first)
+  UPDATE users SET coin_balance = coin_balance - 1
+         WHERE user_id = :me AND coin_balance >= 1 RETURNING coin_balance
+  INSERT coin_transactions             (type = vote_cast / DEBIT, amount = -1,
+                                        balance_after, vote_id, competition_id)
+  UPDATE competitions SET total_votes = total_votes + 1
+COMMIT  — or ROLLBACK
+```
+
+- Exactly **1 coin** is deducted (`users.coin_balance` is never allowed to go negative — the guarded UPDATE + the DB `coin_balance >= 0` constraint).
+- Exactly **one `coin_transactions` row** is created per successful vote, using the seeded **`vote_cast` / DEBIT** lookup row, with signed **`amount = -1`**, `balance_after` = the post-deduction balance, and the `vote_id` + `competition_id` references.
+- **Invalid requests never spend a coin**: self-votes, invalid targets, completed competitions, unauthenticated requests, duplicates, and insufficient balances all reject before (or atomically without) any deduction.
+
+Concurrency & atomicity: the balance is decremented with a single atomic conditional `UPDATE … WHERE coin_balance >= 1 … RETURNING` (the `qr.py` pattern) — of two simultaneous vote transactions only one can win the user's last coin; the loser rolls back its whole vote and gets `400`, so a coin can never be spent twice. Duplicate votes don't reach the balance step (the UNIQUE constraint fires on the very first write). The cleared vote row, the deduction, the ledger insert, and the `total_votes` increment commit together — any failure rolls all of them back. Vote target validity is additionally back-stopped by a `votes` trigger in the model (installed only on table creation; a fresh-database constraint violation surfaces as the same `400`).
 
 Response (`201 Created`):
 
@@ -1101,15 +1118,16 @@ Response (`201 Created`):
   "voter_id": "b5e2d461-…",
   "voted_for_user_id": "6a1c9f10-…",
   "created_at": "2026-08-22T12:00:00.123456",
-  "total_votes": 4
+  "total_votes": 4,
+  "balance_after": 9
 }
 ```
 
-The response exposes only ids, the timestamp, and the updated aggregate count — no password/account/coin data. Individual vote identities (who voted for whom) are never exposed by any endpoint.
+The response exposes only ids, the timestamp, the updated aggregate count, and the voter's resulting `balance_after` (the same convention as QR redemption's `balance`) — no password/account/coin-history data. Individual vote identities (who voted for whom) are never exposed by any endpoint.
 
 ### What this part deliberately does NOT do
 
-- Voting costs **are not implemented**: a vote costs nothing — no coin deduction, no `coin_transactions`, `users.coin_balance` untouched. **Voting is currently FREE** (the 1-vote = 1-coin cost is Phase 4B-2).
+- Voting is implemented at a fixed cost of **1 coin per vote** (`vote_cast` DEBIT ledger row, `balance_after` recorded) — but no other coin features exist yet: no `prize_pool` growth, no winner/reward payout, no refunds, no QR/clothing changes.
 - Does **not** grow `prize_pool`, compute `winner_id`, or distribute rewards — a vote only bumps `competitions.total_votes` and records `voted_for_user_id` in `votes`.
 - Does **not** implement `completed` transitions or automatic competition completion (the DB `completed` status exists and is set by tests/admin tooling, but the app has no completion flow yet).
 - Does **not** create any notifications or touch `device_tokens`.
@@ -1251,9 +1269,18 @@ venv/Scripts/python -m tests.test_competition_discover
 # record; total_votes +1 per vote; unauthenticated 401; challenger/opponent
 # self-vote -> 400 with no row; non-participant target -> 400; duplicate vote
 # -> 409 with count unchanged; concurrent duplicate votes -> one 201/one 409,
-# one row, +1 only; completed competition -> 409; voting is FREE — no
-# coin_balance change and no coin_transactions row)
+# one row, +1 only; completed competition -> 409; each vote spends the voter's
+# coin and writes one vote_cast ledger row)
 venv/Scripts/python -m tests.test_vote_casting
+
+# Vote cost + coin transaction end-to-end (1 coin per vote; balance_after and
+# stored balance agree; exactly one vote_cast DEBIT (-1) ledger row per vote
+# linked to user/vote/competition; 0-coin user -> 400 with nothing changed;
+# duplicate -> 409 with no second coin spent; self/invalid-target/completed/
+# unauthenticated never spend a coin; ledger-type failure rolls back vote +
+# deduction + count atomically; 1-coin user racing two simultaneous valid
+# votes -> one 201/one 400, exactly one vote and one transaction)
+venv/Scripts/python -m tests.test_vote_cost
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), registration creating exactly one avatar for the new user (linked to the user, with server-generated id and created_at — the one-avatar-per-user invariant), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -1296,7 +1323,9 @@ venv/Scripts/python -m tests.test_vote_casting
 
 `test_competition_discover.py` verifies public competition discovery (Phase 6, Part 4A): unauthenticated `GET /competitions/discover` → `401`; viewer C discovers **active** competitions between **other active users** (A-vs-B and A-vs-D appear with their `competition_id`); C's own competitions — as challenger (C-vs-D) **and** as opponent (E-vs-C) — are excluded; a completed competition (E-vs-F) is excluded; a competition whose challenger is deactivated (X-vs-B) and one whose opponent is deactivated (A-vs-Y) are both excluded; every feed item has `status: "active"`, `total_votes: 0`, and the caller as a non-participant; the payload is the `{items, total, limit, offset}` envelope where every user is the four-field `UserPublic` shape with no `password_hash`/`email`/`coin_balance`/`is_active` anywhere; default `limit` is `20`, `limit=50` is accepted, `limit=51`/`limit=0`/negative `offset` → `422`; `limit`/`offset` pages tile the entire feed with no overlap or gaps; and ordering is deterministic `end_time ASC` — the shorter-duration competition appears before the longer one (ending soonest first). All test rows are cleaned up afterward.
 
-`test_vote_casting.py` verifies basic vote casting (Phase 6, Part 4B-1): a third-party voter can vote for the **challenger** (`201` with `vote_id`/`created_at`/`total_votes`) and another for the **opponent** (`201`, `total_votes = 2`); each successful vote creates exactly one `votes` row and bumps stored `total_votes` by exactly 1 (confirmed in the DB); unauthenticated → `401`; the challenger and the opponent voting in their own competition → `400` with no vote row; voting for a non-participant → `400`; a duplicate vote from the same voter → `409` "You have already voted in this competition" with no new row and `total_votes` unchanged (the `UNIQUE(competition_id, voter_id)` constraint is the enforcing layer); two concurrent duplicate votes from one voter → exactly one `201` and one `409`, one vote row, `total_votes` +1 only (atomic `total_votes = total_votes + 1` UPDATE, loser rolled back); voting in a **completed** competition → `409` with no row and the count unchanged; and **coin safety** — after all the voting, every user's `coin_balance` is still `0` and zero `coin_transactions` rows exist (voting is FREE in this stage; the 1-vote = 1-coin cost is Phase 4B-2). All test rows (votes → competitions → requests → users) are cleaned up afterward.
+`test_vote_casting.py` verifies the vote mechanics on top of the coin cost (Phase 6, Part 4B): a third-party voter can vote for the **challenger** (`201` with `vote_id`/`created_at`/`total_votes`/`balance_after`) and another for the **opponent** (`201`, `total_votes = 2`); each successful vote creates exactly one `votes` row and bumps stored `total_votes` by exactly 1 (confirmed in the DB); each successful vote spends the voter's single starting coin (C/D end at 0) and writes one `vote_cast` ledger row (2 total); unauthenticated → `401`; the challenger and the opponent voting in their own competition → `400` with no vote row; voting for a non-participant → `400`; a duplicate vote from the same voter → `409` "You have already voted in this competition" with no new row and `total_votes` unchanged (the `UNIQUE(competition_id, voter_id)` constraint is the enforcing layer, so no second coin is spent); two concurrent duplicate votes from one voter → exactly one `201` and one `409`, one vote row, `total_votes` +1 only; and voting in a **completed** competition → `409` with no row and the count unchanged. The deep coin/ledger coverage lives in `test_vote_cost.py`. All test rows (votes → competitions → requests → users) are cleaned up afterward.
+
+`test_vote_cost.py` verifies the vote cost + coin transaction (Phase 6, Part 4B-2): a user with exactly 1 coin and a user with 5 coins can both vote (`201`); each successful vote deducts exactly **1 coin** (`balance_after` 0 and 4 respectively); each writes exactly one `coin_transactions` row with the seeded **`vote_cast` / `DEBIT`** type, signed `amount = -1`, the correct user/vote/competition references, and `balance_after` equal to the stored post-vote balance; the competition `total_votes` increases by exactly 1 per vote; a **0-coin** user trying to vote → `400` "Not enough coins to vote" with no vote, no transaction, unchanged `total_votes` and unchanged balance; a **duplicate** vote → `409` with no second coin spent, no second transaction, and `total_votes` unchanged; **self-votes**, the **invalid target**, a **completed** competition, and an **unauthenticated** request never spend a coin; **atomicity** — temporarily breaking the `vote_cast` lookup forces a mid-transaction `500` that rolls back the vote, the in-flight deduction, and the count (the user's balance is restored); and **concurrency** — a user with exactly 1 coin casting two simultaneous valid votes (in two different competitions) yields exactly one `201` and one `400`, balance `0`, one vote, and one transaction (the guarded `coin_balance >= 1` UPDATE serializes the last coin). All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
 
 ## Seed data
 

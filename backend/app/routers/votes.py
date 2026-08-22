@@ -1,35 +1,45 @@
 """
-Votes — Phase 6, Part 4B-1. Basic vote casting.
+Votes — Phase 6, Part 4B. Vote casting with a 1-coin cost.
 
   POST /competitions/{competition_id}/votes    cast a vote (201)
 
-FOR THIS STAGE VOTING IS FREE: no coin is deducted, no coin_transactions
-row is written, and users.coin_balance is never touched. The 1-vote = 1-coin
-cost arrives in Part 4B-2.
+A successful vote costs exactly 1 coin (a fixed business rule — no
+configurable price). The whole operation is ONE transaction:
 
-Rules enforced (all against the authenticated JWT identity, never the
-frontend):
-  - the competition must exist (404) and be ACTIVE (409 otherwise);
-  - the voter must NOT be a participant (challenger OR opponent) — a
-    participant can never vote in their own competition;
-  - voted_for_user_id must be one of the two participants;
-  - one vote per user per competition — UNIQUE(competition_id, voter_id).
+    BEGIN
+      validations                 (competition exists/active, not a
+                                   participant, target is a participant)
+      INSERT votes                (UNIQUE(competition_id, voter_id) gate —
+                                   a duplicate rolls back BEFORE any coin
+                                   moves)
+      UPDATE users
+          SET coin_balance = coin_balance - 1
+          WHERE user_id = :me AND coin_balance >= 1
+          RETURNING coin_balance  (atomic, guarded: never negative)
+      INSERT coin_transactions    (type vote_cast/DEBIT, amount -1,
+                                   balance_after, vote_id, competition_id)
+      UPDATE competitions
+          SET total_votes = total_votes + 1
+    COMMIT  — or ROLLBACK
 
-The pseudo-flow (one SQLAlchemy transaction):
+Atomicity: vote + balance + ledger + vote count commit (or roll back)
+together, so "vote exists but coins not deducted", "coins deducted but no
+vote", "ledger row without a vote", etc. are all impossible.
 
-    load competition                  (404 / not-active / self / target checks)
-    INSERT votes
-    atomic UPDATE competitions
-        SET total_votes = total_votes + 1
-    COMMIT  — or ROLLBACK (e.g. duplicate-vote IntegrityError -> 409)
+Concurrency: the balance is decremented with a single atomic conditional
+UPDATE (`coin_balance - 1 ... WHERE coin_balance >= 1`, RETURNING the new
+value) — the same pattern qr.py uses to credit coins. Under READ COMMITTED
+Postgres re-evaluates the WHERE after acquiring the row lock, so a user's
+last coin cannot be spent twice: of two simultaneous vote transactions, only
+one wins the guarded decrement; the other sees `coin_balance >= 1` fail,
+rolls back its vote entirely, and returns the insufficient-coins error.
+Duplicate votes (same voter, same competition) are gated by the UNIQUE
+constraint on the FIRST write (the vote INSERT), before any balance change.
 
-Atomicity: the vote row and the total_votes increment commit (or roll back)
-together, so "vote exists but count unchanged" and "count up but no vote" are
-both impossible. Concurrency: the INSERT is subject to the UNIQUE constraint,
-and the increment is a single atomic `total_votes = total_votes + 1` UPDATE
-(read-modify-write is never done in Python), so two simultaneous votes from
-the same voter yield exactly one row — the loser's transaction rolls back and
-returns 409 — while two different voters each increment the count exactly once.
+Validation ordering: everything that can reject the request (self-vote,
+invalid target, completed competition, duplicate) happens BEFORE the balance
+is touched. Insufficient balance is the last validation and changes nothing
+on failure.
 """
 import uuid
 
@@ -40,12 +50,14 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import Competition, CompetitionStatus, User, Vote
+from app.models import CoinTransaction, CoinTransactionType, Competition, CompetitionStatus, User, Vote
 from app.schemas.vote import VoteCreate, VoteRead
 
 router = APIRouter(prefix="/competitions", tags=["votes"])
 
 _UNIQUE_VOTE_CONSTRAINT = "uq_votes_one_per_user_per_competition"
+_VOTE_COST = 1
+_VOTE_TYPE_NAME = "vote_cast"
 
 
 @router.post(
@@ -81,22 +93,17 @@ def cast_vote(
     ):
         raise _invalid_target()
 
-    db.add(
-        Vote(
-            competition_id=competition_id,
-            voter_id=current_user.user_id,
-            voted_for_user_id=payload.voted_for_user_id,
-        )
+    # --- One atomic business operation: vote + coin balance + ledger + count ---
+    vote = Vote(
+        competition_id=competition_id,
+        voter_id=current_user.user_id,
+        voted_for_user_id=payload.voted_for_user_id,
     )
-    # Atomic increment — an UPDATE that adds one, never a Python read-modify-write.
-    db.execute(
-        update(Competition)
-        .where(Competition.competition_id == competition_id)
-        .values(total_votes=Competition.total_votes + 1)
-    )
-
+    db.add(vote)
     try:
-        db.commit()
+        # Flush the vote FIRST: the UNIQUE(competition_id, voter_id) gate fires
+        # here, so a duplicate is rejected and rolled back BEFORE any coin moves.
+        db.flush()
     except IntegrityError as exc:
         db.rollback()
         if getattr(getattr(exc.orig, "diag", None), "constraint_name", None) == _UNIQUE_VOTE_CONSTRAINT:
@@ -106,14 +113,52 @@ def cast_vote(
         # target rather than a surprising 500.
         raise _invalid_target() from exc
 
-    db.refresh(competition)
-    vote = db.execute(
-        select(Vote).where(
-            Vote.competition_id == competition_id,
-            Vote.voter_id == current_user.user_id,
-        ).limit(1)
-    ).scalars().first()
+    # Atomic guarded deduction (never negative, never a Python read-modify-write).
+    new_balance = db.execute(
+        update(User)
+        .where(User.user_id == current_user.user_id, User.coin_balance >= _VOTE_COST)
+        .values(coin_balance=User.coin_balance - _VOTE_COST)
+        .returning(User.coin_balance)
+    ).scalar_one_or_none()
+    if new_balance is None:
+        # Lost the coin race (or genuinely broke): roll back the vote entirely.
+        db.rollback()
+        raise _insufficient_coins()
 
+    # Resolve the seeded vote_cast DEBIT lookup row by name (never by seed id).
+    vote_type_id = db.scalar(
+        select(CoinTransactionType.type_id).where(
+            CoinTransactionType.type_name == _VOTE_TYPE_NAME
+        )
+    )
+    if vote_type_id is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Vote transaction type is not configured",
+        )
+
+    # Signed amounts: credit = positive, debit = negative (vote_cast is DEBIT).
+    db.add(
+        CoinTransaction(
+            user_id=current_user.user_id,
+            type_id=vote_type_id,
+            amount=-_VOTE_COST,
+            balance_after=new_balance,
+            vote_id=vote.vote_id,
+            competition_id=competition_id,
+        )
+    )
+    # Atomic increment — an UPDATE that adds one, never a Python read-modify-write.
+    db.execute(
+        update(Competition)
+        .where(Competition.competition_id == competition_id)
+        .values(total_votes=Competition.total_votes + 1)
+    )
+
+    db.commit()
+    db.refresh(competition)
+    db.refresh(vote)
     return VoteRead(
         vote_id=vote.vote_id,
         competition_id=competition_id,
@@ -121,6 +166,7 @@ def cast_vote(
         voted_for_user_id=vote.voted_for_user_id,
         created_at=vote.created_at,
         total_votes=competition.total_votes,
+        balance_after=new_balance,
     )
 
 
@@ -168,4 +214,11 @@ def _already_voted() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail="You have already voted in this competition",
+    )
+
+
+def _insufficient_coins() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Not enough coins to vote",
     )
