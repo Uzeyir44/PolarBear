@@ -28,3 +28,17 @@ class CompetitionRead(BaseModel):
     start_time: datetime
     end_time: datetime
     created_at: datetime
+
+
+class CompetitionDiscoverResult(BaseModel):
+    """Envelope for GET /competitions/discover.
+
+    `items` reuses the same safe CompetitionRead item shape as everywhere else
+    in the app; `total`/`limit`/`offset` mirror the established envelope of
+    the wardrobe and clothing feeds.
+    """
+
+    items: list[CompetitionRead]
+    total: int
+    limit: int
+    offset: int

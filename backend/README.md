@@ -888,7 +888,7 @@ Same rules, but only the **challenger** may cancel their own outgoing request (e
 
 No migration and no seed data were required: the `competition_requests` table and its status enum already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
 
-## Competitions (Phase 6, Parts 2–3)
+## Competitions (Phase 6, Parts 2–4)
 
 Competition creation is not a standalone endpoint: it happens **inside** `POST /competition-requests/{request_id}/accept`, atomically with the request's transition to `ACCEPTED`. Accepting a valid PENDING request creates one `ACTIVE` `competitions` row that stays linked to its request through `competitions.request_id` (UNIQUE), copying the immutable terms from the request.
 
@@ -1016,13 +1016,102 @@ Response (`200 OK`) — an array of the same `CompetitionRead` shape (full examp
 ]
 ```
 
-Errors: missing/invalid/expired token → `401`; invalid `status`/`limit`/`offset` → `422`. There is deliberately **no public discovery feed** — both the list and the detail endpoint are strictly participant-scoped until a later Phase.
+### Discover public competitions (`GET /competitions/discover`)
+
+The community feed for voting (Phase 6 Part 4A): returns **other users' ACTIVE competitions** so the authenticated caller can open — and, in Phase 4B, vote on — competitions without being a participant. Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`.
+
+What appears (all of these must hold):
+
+- status = `active` only (completed competitions never appear).
+- The caller is **not** the challenger **and** not the opponent — the caller's own competitions are excluded (a participant can never vote in their own competition).
+- Both the challenger and the opponent are **active** accounts. A competition whose challenger or opponent has been deactivated is simply excluded from the feed (nothing is modified).
+
+Query parameters:
+
+| Param | Rules |
+| --- | --- |
+| `limit` | Optional, default `20`, min `1`, max `50`. Out of range → `422`. |
+| `offset` | Optional, default `0`, min `0`. Out of range → `422`. |
+
+Request body: none.
+
+Ordering: deterministic — `end_time ASC` (the competition ending soonest first, most time-sensitive to vote on), tie-broken by `competition_id`.
+
+Response (`200 OK`) — an envelope in the same style as the wardrobe/clothing feeds (`items`, `total`, `limit`, `offset`); each item is the safe `CompetitionRead` shape (full example above — for the feed the meaningful card fields are `competition_id`, `challenger`, `opponent`, `status`, `total_votes`, `start_time`, `end_time`):
+
+```json
+{
+  "items": [
+    {
+      "competition_id": "3f0a1c55-…",
+      "request_id": "c9a1f3e0-…",
+      "challenger": { "user_id": "6a1c9f10-…", "username": "polar_bear", "profile_picture_url": "…", "biography": "…" },
+      "opponent": { "user_id": "8bbf17f2-…", "username": "gummy", "profile_picture_url": null, "biography": null },
+      "status": "active",
+      "prize_pool": 0,
+      "total_votes": 0,
+      "winner_id": null,
+      "duration_minutes": 60,
+      "start_time": "2026-08-22T09:15:00.123456",
+      "end_time": "2026-08-22T10:15:00.123456",
+      "created_at": "2026-08-22T09:15:00.123456"
+    }
+  ],
+  "total": 1,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+Only the aggregate `total_votes` is exposed — no per-participant vote counts and no voter identities. Both participants are the four-field `UserPublic` shape; `email`, `password_hash`, `coin_balance`, `is_active`, auth-provider and device-token data never appear.
+
+Errors: missing/invalid/expired token → `401`; invalid `limit`/`offset` → `422`. Unlike `GET /competitions` and `GET /competitions/{id}` (which are participant-scoped), discovery is a public, authenticated view of OTHER users' competitions. Voting is implemented (see below) — voting is currently **FREE**.
+
+### Cast a vote (`POST /competitions/{competition_id}/votes`)
+
+Lets the authenticated user vote in an **ACTIVE** competition they are **not** a participant of. Response is a confirmation with the fresh `total_votes`. Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`.
+
+**Current version: voting itself is implemented, but voting is currently FREE.** No coins are deducted, no `coin_transactions` row is written, and `users.coin_balance` is never touched. The next feature (Part 4B-2) will introduce **1 vote = 1 coin**.
+
+Request body (`VoteCreate`):
+
+```json
+{
+  "voted_for_user_id": "6a1c9f10-…"
+}
+```
+
+Rules (all enforced from the JWT identity, never the frontend):
+
+- The competition must exist → else `404` "Competition not found".
+- It must be `ACTIVE` — voting in a completed competition → `409` "Competition is no longer active".
+- **Self-voting is impossible**: a participant (challenger **or** opponent) → `400` "You cannot vote in your own competition". A can never vote for B in the A-vs-B competition.
+- `voted_for_user_id` must be one of the two participants (challenger or opponent) → else `400` "You can only vote for a participant of this competition".
+- **One vote per user per competition**: enforced by `UNIQUE(competition_id, voter_id)` — a second `POST` from the same voter → `409` "You have already voted in this competition". Votes are immutable (no switching, no deleting — a second vote is simply rejected).
+- Invalid `competition_id` or `voted_for_user_id` (bad UUID) → normal Pydantic `422`.
+
+Atomicity & concurrency: the `votes` INSERT and the `total_votes` increment are one transaction — the count only moves if the vote row is created, and vice-versa. `total_votes` is bumped with a single atomic `UPDATE competitions SET total_votes = total_votes + 1` (never a Python read-modify-write), so simultaneous votes from different users each count exactly once; simultaneous duplicate votes from the same user are serialized by the UNIQUE constraint — exactly one succeeds, the loser rolls back and gets `409`. Vote target validity is additionally back-stopped by a `votes` trigger in the model (installed only on table creation; a fresh-database constraint violation surfaces as the same `400`).
+
+Response (`201 Created`):
+
+```json
+{
+  "vote_id": "9c447a2f-…",
+  "competition_id": "3f0a1c55-…",
+  "voter_id": "b5e2d461-…",
+  "voted_for_user_id": "6a1c9f10-…",
+  "created_at": "2026-08-22T12:00:00.123456",
+  "total_votes": 4
+}
+```
+
+The response exposes only ids, the timestamp, and the updated aggregate count — no password/account/coin data. Individual vote identities (who voted for whom) are never exposed by any endpoint.
 
 ### What this part deliberately does NOT do
 
-- Does **not** add vote endpoints, vote costs, coin deduction, or `coin_transactions`.
-- Does **not** grow `prize_pool`, calculate totals from real votes, compute `winner_id`, or distribute rewards — `total_votes = 0`, `prize_pool = 0`, `winner_id = NULL` until those Phases.
-- Does **not** implement `completed` transitions, winner calculation, or reward distribution (the DB `completed` status exists and is set by tests/admin tooling, but the app has no completion flow yet).
+- Voting costs **are not implemented**: a vote costs nothing — no coin deduction, no `coin_transactions`, `users.coin_balance` untouched. **Voting is currently FREE** (the 1-vote = 1-coin cost is Phase 4B-2).
+- Does **not** grow `prize_pool`, compute `winner_id`, or distribute rewards — a vote only bumps `competitions.total_votes` and records `voted_for_user_id` in `votes`.
+- Does **not** implement `completed` transitions or automatic competition completion (the DB `completed` status exists and is set by tests/admin tooling, but the app has no completion flow yet).
 - Does **not** create any notifications or touch `device_tokens`.
 
 No migration was required: the `competitions` and `competition_status` tables (with their `active`/`completed` seed rows) already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
@@ -1147,6 +1236,24 @@ venv/Scripts/python -m tests.test_competition_creation
 # with status filter active/completed + 422 on invalid + 401 unauth; detail
 # remains participant-only; concurrent accepts at 2 active -> exactly 3 total)
 venv/Scripts/python -m tests.test_competition_management
+
+# Public competition discovery end-to-end (401 unauth; active competitions
+# between two OTHER active users appear with competition_id; own competitions
+# as challenger AND as opponent excluded; completed excluded; inactive
+# challenger/opponent excluded; UserPublic-only payload with no sensitive
+# fields; default limit 20, max 50 enforced, invalid limit/offset -> 422;
+# limit/offset pages tile the whole feed without overlap; deterministic
+# end_time ASC ordering, shorter-duration competition first)
+venv/Scripts/python -m tests.test_competition_discover
+
+# Basic vote casting end-to-end (third-party users vote for challenger AND
+# opponent -> 201 with confirmation + fresh total_votes; exactly one vote
+# record; total_votes +1 per vote; unauthenticated 401; challenger/opponent
+# self-vote -> 400 with no row; non-participant target -> 400; duplicate vote
+# -> 409 with count unchanged; concurrent duplicate votes -> one 201/one 409,
+# one row, +1 only; completed competition -> 409; voting is FREE — no
+# coin_balance change and no coin_transactions row)
+venv/Scripts/python -m tests.test_vote_casting
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), registration creating exactly one avatar for the new user (linked to the user, with server-generated id and created_at — the one-avatar-per-user invariant), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -1186,6 +1293,10 @@ venv/Scripts/python -m tests.test_competition_management
 `test_competition_creation.py` verifies competition creation & lifecycle (Phase 6, Part 2): accepting a valid PENDING request returns `200`, transitions the request to `ACCEPTED`, and creates **exactly one** `ACTIVE` competition whose `request_id`/`challenger_id`/`opponent_id`/`duration_minutes` are copied from the request; `status` resolves to the `active` lookup row, `total_votes` = 0, `winner_id` = NULL, `prize_pool` = 0 (DB server default), `start_time` populated, and `end_time` (a DB GENERATED column) = `start_time` + duration in wall-clock minutes; `GET /competitions/{competition_id}` returns `200` with the full line of safe fields to **either** participant (challenger A and opponent B), `403` to a non-participant, `401` unauthenticated, and never leaks email/password/coin/streak data; re-accepting an already-ACCEPTED request → `409` with still exactly one competition ("same request cannot produce two competitions"); atomicity — when the competition INSERT is forced to fail (a pre-existing competition row for the same request), the accept returns `409`, the request rolls back to `PENDING`, and only the pre-existing competition survives; a challenger or an unrelated user accepting → `403` and creates no competition, the request left `PENDING`; and two concurrent HTTP accepts of the same PENDING request → exactly one `200` and one `409`, exactly one competition row, request `ACCEPTED`. All test rows (competitions → requests → users, in FK-correct order) are cleaned up afterward.
 
 `test_competition_management.py` verifies competition management & discovery (Phase 6, Part 3): a user with 0/1/2 active competitions can accept (reaching 3), but once at 3 active they cannot accept another — both "opponent at 3" and "challenger at 3" return `409`, leave the request `PENDING`, and create no competition; the duplicate active-matchup rule blocks a second A-vs-B in either direction (`409`, request `PENDING`, no row) while an A-vs-B **recompete succeeds after completion**; completed competitions are excluded from the 3-active count (after completing one, the user at 2 active accepts the same opponent again → `200` at 3 active); `GET /competitions` is participant-scoped (A sees only A's competitions, D never sees the A-vs-B one), `?status=active` returns only active with `end_time ASC` (soonest-ending first), `?status=completed` only completed, an invalid status → `422`, and unauthenticated → `401`; `GET /competitions/{id}` stays participant-only (`200` for challenger/opponent, `403` for a third user, `401` unauthenticated); and concurrency — a user at 2 active who accepts two pending requests simultaneously ends with **exactly 3 active** competitions: one `200` + one `409`, one new competition, one request `ACCEPTED` and the other left `PENDING` (serialized by the `FOR UPDATE` user-row locks). All test rows are cleaned up afterward.
+
+`test_competition_discover.py` verifies public competition discovery (Phase 6, Part 4A): unauthenticated `GET /competitions/discover` → `401`; viewer C discovers **active** competitions between **other active users** (A-vs-B and A-vs-D appear with their `competition_id`); C's own competitions — as challenger (C-vs-D) **and** as opponent (E-vs-C) — are excluded; a completed competition (E-vs-F) is excluded; a competition whose challenger is deactivated (X-vs-B) and one whose opponent is deactivated (A-vs-Y) are both excluded; every feed item has `status: "active"`, `total_votes: 0`, and the caller as a non-participant; the payload is the `{items, total, limit, offset}` envelope where every user is the four-field `UserPublic` shape with no `password_hash`/`email`/`coin_balance`/`is_active` anywhere; default `limit` is `20`, `limit=50` is accepted, `limit=51`/`limit=0`/negative `offset` → `422`; `limit`/`offset` pages tile the entire feed with no overlap or gaps; and ordering is deterministic `end_time ASC` — the shorter-duration competition appears before the longer one (ending soonest first). All test rows are cleaned up afterward.
+
+`test_vote_casting.py` verifies basic vote casting (Phase 6, Part 4B-1): a third-party voter can vote for the **challenger** (`201` with `vote_id`/`created_at`/`total_votes`) and another for the **opponent** (`201`, `total_votes = 2`); each successful vote creates exactly one `votes` row and bumps stored `total_votes` by exactly 1 (confirmed in the DB); unauthenticated → `401`; the challenger and the opponent voting in their own competition → `400` with no vote row; voting for a non-participant → `400`; a duplicate vote from the same voter → `409` "You have already voted in this competition" with no new row and `total_votes` unchanged (the `UNIQUE(competition_id, voter_id)` constraint is the enforcing layer); two concurrent duplicate votes from one voter → exactly one `201` and one `409`, one vote row, `total_votes` +1 only (atomic `total_votes = total_votes + 1` UPDATE, loser rolled back); voting in a **completed** competition → `409` with no row and the count unchanged; and **coin safety** — after all the voting, every user's `coin_balance` is still `0` and zero `coin_transactions` rows exist (voting is FREE in this stage; the 1-vote = 1-coin cost is Phase 4B-2). All test rows (votes → competitions → requests → users) are cleaned up afterward.
 
 ## Seed data
 

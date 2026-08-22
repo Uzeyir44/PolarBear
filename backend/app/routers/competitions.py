@@ -1,40 +1,45 @@
 """
-Competitions — Phase 6, Parts 2–3. Competition creation happens inside
+Competitions — Phase 6, Parts 2–4. Competition creation happens inside
 acceptance (see routers/competition_requests.py); this router owns
 retrieval and discovery.
 
-  GET /competitions/{competition_id}   retrieve one competition (200)
+  GET /competitions/{competition_id}   retrieve one competition (200, participant-only)
   GET /competitions                    list the caller's competitions (200)
+  GET /competitions/discover           public feed of OTHER users' ACTIVE competitions (200)
 
-A competition is PRIVATE to its two participants at this stage. The detail
-endpoint only lets the challenger or the opponent in (other authenticated
-users get 403, unauthenticated get 401). Discovery ("my competitions") is
-participant-scoped too — it filters WHERE current_user is challenger OR
-opponent, so one user can never see competitions they are not part of.
+The detail endpoint only lets the challenger or the opponent in (other
+authenticated users get 403, unauthenticated get 401). GET /competitions is
+participant-scoped too — the caller only ever sees competitions they are in.
 
-GET /competitions supports an optional status filter (active|completed —
-invalid values are rejected by FastAPI with 422) and limit/offset pagination
-(the same convention as /users/me/transactions). Ordering is deterministic:
-active competitions end soonest first (end_time ASC), completed most recently
-ended first (end_time DESC), and an unfiltered list newest-created first
-(created_at DESC, competition_id DESC tiebreak).
+GET /competitions/discover is the vote-stage discovery feed: ACTIVE
+competitions between two OTHER ACTIVE users, so the authenticated caller can
+open (and, in Part 4B, vote on) competitions without being a participant. It
+excludes the caller's own competitions (challenger OR opponent — a
+participant cannot vote in their own competition), completed competitions,
+and competitions whose challenger or opponent account is inactive. Response
+uses the wardrobe/clothing-style envelope {items, total, limit, offset},
+ordered by end_time ASC (ending soonest first) with a competition_id tiebreak.
 
 The payload is the safe CompetitionRead shape: both participants embed
 UserPublic (never password_hash/email/coin_balance/streak/account fields),
 status comes from the competition_status lookup row's status_name
 ("active"/"completed"), winner_id is null until completion is implemented.
+
+Route ordering note: /discover is a STATIC path and MUST be declared before
+/{competition_id}, otherwise FastAPI would treat "discover" as a UUID and
+reject it with 422.
 """
 import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
 from app.models import Competition, CompetitionStatus, User
-from app.schemas.competition import CompetitionRead
+from app.schemas.competition import CompetitionDiscoverResult, CompetitionRead
 from app.schemas.user import UserPublic
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
@@ -96,6 +101,62 @@ def list_competitions(
 
     rows = db.execute(query.limit(limit).offset(offset)).scalars().all()
     return [_to_competition_read(c) for c in rows]
+
+
+@router.get("/discover", response_model=CompetitionDiscoverResult)
+def discover_competitions(
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=50,
+        description="How many competitions to return (1-50)",
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="How many competitions to skip before returning results",
+    ),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CompetitionDiscoverResult:
+    # The public feed: ACTIVE competitions between OTHER active users, so the
+    # caller has something to open (and later vote on) without being a
+    # participant. Excludes the caller's own competitions (own challenger OR
+    # opponent — a participant can never vote themselves) and competitions
+    # whose challenger or opponent account is inactive. status/participant
+    # filters are applied on FK/filter columns (challenger_id/opponent_id),
+    # never on anything the client controls.
+    active_id = _status_id(db, "active")
+    conditions = [
+        Competition.status_id == active_id,
+        Competition.challenger_id != current_user.user_id,
+        Competition.opponent_id != current_user.user_id,
+        Competition.challenger.has(User.is_active.is_(True)),
+        Competition.opponent.has(User.is_active.is_(True)),
+    ]
+
+    total = db.scalar(select(func.count()).select_from(Competition).where(*conditions))
+    rows = db.execute(
+        select(Competition)
+        .where(*conditions)
+        .options(
+            joinedload(Competition.challenger),
+            joinedload(Competition.opponent),
+            joinedload(Competition.status),
+        )
+        # Ending soonest first — the most time-sensitive to vote on — with a
+        # deterministic competition_id tiebreak.
+        .order_by(Competition.end_time.asc(), Competition.competition_id.asc())
+        .limit(limit)
+        .offset(offset)
+    ).scalars().all()
+
+    return CompetitionDiscoverResult(
+        items=[_to_competition_read(c) for c in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{competition_id}", response_model=CompetitionRead)

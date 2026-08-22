@@ -21,7 +21,8 @@ from .wardrobe import (
     WardrobeList,
 )
 from .avatar import AvatarEquipmentMap, AvatarRead, AvatarSlotEquipment
-from .competition import CompetitionRead
+from .competition import CompetitionDiscoverResult, CompetitionRead
+from .vote import VoteCreate, VoteRead
 
 __all__ = [
     "CoinBalance",
@@ -61,4 +62,7 @@ __all__ = [
     "AvatarSlotEquipment",
     "AvatarEquipmentMap",
     "CompetitionRead",
+    "CompetitionDiscoverResult",
+    "VoteCreate",
+    "VoteRead",
 ]

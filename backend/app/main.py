@@ -3,7 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.routers import admin_router, auth_router, avatar_router, clothing_router, competition_requests_router, competitions_router, qr_router, users_router, wardrobe_router
+from app.routers import admin_router, auth_router, avatar_router, clothing_router, competition_requests_router, competitions_router, qr_router, users_router, votes_router, wardrobe_router
 
 app = FastAPI()
 app.include_router(auth_router)
@@ -14,6 +14,7 @@ app.include_router(wardrobe_router)
 app.include_router(avatar_router)
 app.include_router(competition_requests_router)
 app.include_router(competitions_router)
+app.include_router(votes_router)
 app.include_router(admin_router)
 
 
