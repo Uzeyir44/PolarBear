@@ -848,7 +848,7 @@ Requests sent by the authenticated user (`challenger_id == current_user.user_id`
 
 ### Accept a request (`POST /competition-requests/{request_id}/accept`)
 
-Only the **opponent** can accept (anyone else → `403`). The request must still be `PENDING` (else `409`) and exist (else `404`). On success the request becomes `ACCEPTED` with `responded_at` set; **no competition is created**.
+Only the **opponent** can accept (anyone else → `403`). The request must still be `PENDING` (else `409`) and exist (else `404`). On success (Phase 6 Part 2) the request becomes `ACCEPTED` with `responded_at` set **and an `ACTIVE` `competitions` row is created from the same data — both in ONE database transaction** (see [Competitions (Phase 6, Part 2)](#competitions-phase-6-part-2)). The response body is unchanged: it returns the accepted request.
 
 Response (`200 OK`): the `CompetitionRequestRead` shape with `"status": "ACCEPTED"` and a non-null `responded_at`.
 
@@ -873,6 +873,9 @@ Same rules, but only the **challenger** may cancel their own outgoing request (e
 | Wrong participant (accept/decline) | `403` | `You are not the opponent of this request` |
 | Wrong participant (cancel) | `403` | `You are not the challenger of this request` |
 | Request already responded to (any terminal state, or a lost concurrency race) | `409` | `Competition request is no longer pending` |
+| Either participant already has 3 active competitions (accept only) | `409` | `The active competition limit has been reached (maximum 3)` |
+| The two users already have an active competition (accept only) | `409` | `These users already have an active competition` |
+| A competition for this request already exists (legacy row, accept only) | `409` | `A competition for this request already exists` |
 
 ### Response safety
 
@@ -880,11 +883,149 @@ Same rules, but only the **challenger** may cancel their own outgoing request (e
 
 ### What this part deliberately does NOT do
 
-- Does **not** create a `competitions` row on accept.
-- Does **not** touch `users.coin_balance` or `coin_transactions` — there are no coin operations in this feature.
-- Does **not** implement prize pools, voting, vote costs, winner calculation, rewards, competition completion, or (push) notifications — those are separate future Phases.
+- Does **not** move coins: `users.coin_balance` and the `coin_transactions` ledger are untouched — there are no coin operations in the request lifecycle itself.
+- Does **not** implement voting, vote costs, prize-pool growth, winner calculation, rewards, competition completion, or (push) notifications — those are separate future Phases. (Competition **creation** on accept is Part 2 and is implemented; see the next section.)
 
 No migration and no seed data were required: the `competition_requests` table and its status enum already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
+
+## Competitions (Phase 6, Parts 2–3)
+
+Competition creation is not a standalone endpoint: it happens **inside** `POST /competition-requests/{request_id}/accept`, atomically with the request's transition to `ACCEPTED`. Accepting a valid PENDING request creates one `ACTIVE` `competitions` row that stays linked to its request through `competitions.request_id` (UNIQUE), copying the immutable terms from the request.
+
+### Active-competition limits (business rule)
+
+A user may participate in a **maximum of 3 ACTIVE competitions simultaneously**, and a given unordered pair of users may have **at most 1 ACTIVE competition** at a time (either direction). Only `status = 'active'` competitions count — **completed competitions do not count toward the limit**, and an old A-vs-B competition being completed is exactly what allows a new A-vs-B to start.
+
+Enforcement happens on **acceptance, atomically with competition creation**:
+
+```
+BEGIN
+  SELECT … FOR UPDATE on BOTH participant user rows   (serialize, see below)
+  check challenger active-count < 3
+  check opponent   active-count < 3
+  check no existing active A-vs-B matchup (either direction)
+  conditional request UPDATE -> ACCEPTED (WHERE status = 'PENDING')
+  INSERT competition
+COMMIT  — or ROLLBACK
+```
+
+- If **either participant already has 3 active competitions**, or the pair already **has an active competition**, the accept returns `409` and the whole transaction rolls back.
+- The **request is left PENDING** — it is **not** auto-DECLINED or CANCELLED, so it can be accepted later (after an active competition completes or the matchup ends). No new request status was introduced.
+- `409` details: `"The active competition limit has been reached (maximum 3)"` / `"These users already have an active competition"`.
+
+Concurrency safety: the accept takes `SELECT … FOR UPDATE` row locks on **both** participant user rows (in sorted order, so the locking protocol is deadlock-free) **before** counting active competitions. Because every competition-creation transaction locks every user it touches, two simultaneous accepts involving the same user serialize on that user's row — a stale active-count read is impossible. (This is the `qr.py` "the lock, not the check, is what makes it safe" pattern.) A concurrency test drives a user at 2 active who accepts two requests at once and confirms exactly one succeeds — 3 active total, never 4.
+
+### Atomically accepting + creating the competition
+
+```
+BEGIN
+  conditional request UPDATE  -> status = ACCEPTED  (WHERE status = 'PENDING')   [only the opponent]
+  INSERT competitions          -> request_id, challenger_id, opponent_id,
+                                 duration_minutes copied from the request,
+                                 status_id = 'active' (lookup, resolved by name),
+                                 start_time = now (naive UTC, project convention)
+COMMIT  — or ROLLBACK if the INSERT fails
+```
+
+What the database fills in for you: `end_time` is a Postgres **GENERATED** column (`start_time + duration_minutes * interval '1 minute'`), `prize_pool` defaults to **0**, `total_votes` defaults to **0**, `winner_id` is `NULL`, and `created_at` is `now()`.
+
+Atomicity guarantees:
+
+- The request can never be left `ACCEPTED` without its competition, and a competition can never exist while its request is still `PENDING`. If the `competitions` INSERT fails, the whole transaction rolls back — the request stays `PENDING`.
+- **One competition per request** is guaranteed twice over: the `competitions.request_id` UNIQUE constraint at the database level, and the conditional `status = 'PENDING'` UPDATE at the application level. Of two concurrent accept attempts, only one wins the conditional UPDATE and only that transaction ever runs the competition INSERT; the loser gets `409` and creates nothing (verified by the concurrency test).
+
+### Retrieve a competition (`GET /competitions/{competition_id}`)
+
+A competition is **private to its two participants** at this stage — the challenger and the opponent. Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`.
+
+- A participant (challenger **or** opponent) → `200` with the `CompetitionRead` shape below.
+- Any other authenticated user → `403` "You are not a participant of this competition".
+- Unknown `competition_id` → `404` "Competition not found".
+- To find competitions without knowing an id up front, use `GET /competitions` (below).
+
+Request body: none.
+
+Response (`200 OK`) — the exact `CompetitionRead` shape:
+
+```json
+{
+  "competition_id": "3f0a1c55-…",
+  "request_id": "c9a1f3e0-…",
+  "challenger": {
+    "user_id": "6a1c9f10-…",
+    "username": "polar_bear",
+    "profile_picture_url": "https://…/avatar.png",
+    "biography": "I love cold snacks"
+  },
+  "opponent": {
+    "user_id": "8bbf17f2-…",
+    "username": "gummy",
+    "profile_picture_url": null,
+    "biography": null
+  },
+  "status": "active",
+  "prize_pool": 0,
+  "total_votes": 0,
+  "winner_id": null,
+  "duration_minutes": 60,
+  "start_time": "2026-08-22T09:15:00.123456",
+  "end_time": "2026-08-22T10:15:00.123456",
+  "created_at": "2026-08-22T09:15:00.123456"
+}
+```
+
+Important response fields: `status` is the competition_status lookup row's `status_name` (`"active"`, later `"completed"`); `winner_id` is exposed only when a winner exists (null until completion is implemented); both participants are the four-field `UserPublic` shape — never `email`/`password_hash`/`coin_balance`/`winning_streak`/account fields.
+
+### List my competitions (`GET /competitions`)
+
+Discovery for the mobile client — returns the authenticated user's competitions **only** (where `current_user` is the challenger **or** the opponent). Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`. A user can never see competitions they are not part of (the filter is `WHERE challenger_id = me OR opponent_id = me`, and the user id comes only from the JWT).
+
+Query parameters:
+
+| Param | Rules |
+| --- | --- |
+| `status` | Optional. `active` or `completed`. Returns only competitions in that state. Missing/invalid values (`Literal`) → `422`. |
+| `limit` | Optional, default `20`, min `1`, max `50`. Out of range → `422`. |
+| `offset` | Optional, default `0`, min `0`. Out of range → `422`. |
+
+Request body: none.
+
+Ordering is deterministic:
+- `status=active` → `end_time ASC` (the competition ending soonest first), tie-broken by `competition_id`.
+- `status=completed` → `end_time DESC` (most recently ended first).
+- no `status` → `created_at DESC`, `competition_id DESC` (newest-created first).
+
+Response (`200 OK`) — an array of the same `CompetitionRead` shape (full example above), one element per competition:
+
+```json
+[
+  {
+    "competition_id": "3f0a1c55-…",
+    "request_id": "c9a1f3e0-…",
+    "challenger": { "user_id": "6a1c9f10-…", "username": "polar_bear", "profile_picture_url": "…", "biography": "…" },
+    "opponent": { "user_id": "8bbf17f2-…", "username": "gummy", "profile_picture_url": null, "biography": null },
+    "status": "active",
+    "prize_pool": 0,
+    "total_votes": 0,
+    "winner_id": null,
+    "duration_minutes": 60,
+    "start_time": "2026-08-22T09:15:00.123456",
+    "end_time": "2026-08-22T10:15:00.123456",
+    "created_at": "2026-08-22T09:15:00.123456"
+  }
+]
+```
+
+Errors: missing/invalid/expired token → `401`; invalid `status`/`limit`/`offset` → `422`. There is deliberately **no public discovery feed** — both the list and the detail endpoint are strictly participant-scoped until a later Phase.
+
+### What this part deliberately does NOT do
+
+- Does **not** add vote endpoints, vote costs, coin deduction, or `coin_transactions`.
+- Does **not** grow `prize_pool`, calculate totals from real votes, compute `winner_id`, or distribute rewards — `total_votes = 0`, `prize_pool = 0`, `winner_id = NULL` until those Phases.
+- Does **not** implement `completed` transitions, winner calculation, or reward distribution (the DB `completed` status exists and is set by tests/admin tooling, but the app has no completion flow yet).
+- Does **not** create any notifications or touch `device_tokens`.
+
+No migration was required: the `competitions` and `competition_status` tables (with their `active`/`completed` seed rows) already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
 
 ## Security notes
 
@@ -988,6 +1129,24 @@ venv/Scripts/python -m tests.test_avatar
 # outgoing isolation, accept/decline/cancel role rules 403, terminal-state
 # retries 409, responded_at populated on transition, outsider isolation)
 venv/Scripts/python -m tests.test_competition_requests
+
+# Competition creation & lifecycle end-to-end (accept atomically creates one
+# ACTIVE competition, request/parties/duration copied, status active,
+# total_votes 0, winner NULL, start_time set, end_time = start_time + duration,
+# prize_pool 0, atomicity rollback on a duplicate-competition INSERT failure,
+# re-accept 409, concurrent accepts -> one 200 + one 409 + one competition,
+# accept authorization 403s create nothing, participant-only retrieval with a
+# safe whitelisted payload, unauthenticated 401)
+venv/Scripts/python -m tests.test_competition_creation
+
+# Competition management & discovery end-to-end (max 3 ACTIVE per user: 0/1/2
+# active can accept, 3 cannot, challenger-at-3 and opponent-at-3 both block
+# with 409 + request left PENDING + no competition; completed competitions
+# excluded from the limit; duplicate active matchup blocked both directions,
+# recompete allowed after completion; GET /competitions participant-scoped
+# with status filter active/completed + 422 on invalid + 401 unauth; detail
+# remains participant-only; concurrent accepts at 2 active -> exactly 3 total)
+venv/Scripts/python -m tests.test_competition_management
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), registration creating exactly one avatar for the new user (linked to the user, with server-generated id and created_at — the one-avatar-per-user invariant), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -1023,6 +1182,10 @@ venv/Scripts/python -m tests.test_competition_requests
 `test_avatar.py` verifies the avatar retrieval endpoint: missing/invalid/expired token → `401`; a registered user WITHOUT an avatar gets an explicit `404` "Avatar not found" (no silent creation in a read endpoint); an avatar with nothing equipped → `200` with the correct `avatar_id` and ALL SIX slot keys present and explicitly null; one equipped TOP item (placed through the real wardrobe equip endpoint) appears only in `top` with the correct `item_id`/name/image URL/category slot/server-written `equipped_at` while every other slot stays null; items equipped into all six slots each appear in THEIR OWN slot and never in another's; replacement — after equipping Shirt B over Shirt A in TOP, the payload reports Shirt B and Shirt A's id appears nowhere; user isolation — users A and B with differently equipped avatars each see ONLY their own `avatar_id` and equipment in both directions, and smuggled `?user_id=`/`?avatar_id=` query parameters are ignored entirely; availability independence — an equipped item an admin marks `UNAVAILABLE` stays visible on the avatar with its current status; data safety — the envelope exposes exactly `avatar_id`/`equipment`, the map exactly the six slot keys, occupied slots exactly `equipped_at`/`item`, items match the public catalog shape, and no password/email/auth-provider/balance/streak/biography/username fragments appear anywhere in the payload. Equipment is placed exclusively through the wardrobe equip endpoint so Phase 4 → Phase 5 integration is exercised end to end. All test users, avatars, items, and categories are cleaned up afterward.
 
 `test_competition_requests.py` verifies the competition-request lifecycle (Phase 6, Part 1): unauthenticated → `401` on all six endpoints; a successful send → `201` with `status: "PENDING"`, correct parties, `duration_minutes`, and `responded_at: null`; a body-supplied `challenger_id`/`status` is ignored — the challenger always comes from the JWT; self-challenge → `400`; nonexistent opponent → `404`; inactive opponent → `400` (from any sender); invalid durations (`15`, `120`, `0`, `-30`) → `422` while all four valid durations (`30`/`60`/`360`/`1440`) → `201`; duplicate PENDING requests to the same opponent are allowed (the documented design), each with a distinct `request_id`; responses expose only `request_id`/`challenger`/`opponent`/`duration_minutes`/`status`/`created_at`/`responded_at` where both users are the four-field `UserPublic` shape (no email/password/coin/streak leakage); incoming/outgoing lists are strictly isolated (B sees requests addressed to B, C sees none of A/B's); accept/decline by the opponent and cancel by the challenger → `200` with the terminal status and a populated `responded_at` (verified in both the response and the DB); the wrong party (challenger accepts/declines, opponent cancels, non-participant anything) → `403` with the request left untouched; non-pending requests (ACCEPTED/DECLINED/CANCELLED) reject accept/decline/cancel with `409`, including all invalid cross-transitions; a nonexistent `request_id` → `404`; and an outsider's attempts to accept/decline/cancel another user's request all fail `403` with the state unchanged. All test users and their requests (removed first because the user FKs are `RESTRICT`) are cleaned up afterward.
+
+`test_competition_creation.py` verifies competition creation & lifecycle (Phase 6, Part 2): accepting a valid PENDING request returns `200`, transitions the request to `ACCEPTED`, and creates **exactly one** `ACTIVE` competition whose `request_id`/`challenger_id`/`opponent_id`/`duration_minutes` are copied from the request; `status` resolves to the `active` lookup row, `total_votes` = 0, `winner_id` = NULL, `prize_pool` = 0 (DB server default), `start_time` populated, and `end_time` (a DB GENERATED column) = `start_time` + duration in wall-clock minutes; `GET /competitions/{competition_id}` returns `200` with the full line of safe fields to **either** participant (challenger A and opponent B), `403` to a non-participant, `401` unauthenticated, and never leaks email/password/coin/streak data; re-accepting an already-ACCEPTED request → `409` with still exactly one competition ("same request cannot produce two competitions"); atomicity — when the competition INSERT is forced to fail (a pre-existing competition row for the same request), the accept returns `409`, the request rolls back to `PENDING`, and only the pre-existing competition survives; a challenger or an unrelated user accepting → `403` and creates no competition, the request left `PENDING`; and two concurrent HTTP accepts of the same PENDING request → exactly one `200` and one `409`, exactly one competition row, request `ACCEPTED`. All test rows (competitions → requests → users, in FK-correct order) are cleaned up afterward.
+
+`test_competition_management.py` verifies competition management & discovery (Phase 6, Part 3): a user with 0/1/2 active competitions can accept (reaching 3), but once at 3 active they cannot accept another — both "opponent at 3" and "challenger at 3" return `409`, leave the request `PENDING`, and create no competition; the duplicate active-matchup rule blocks a second A-vs-B in either direction (`409`, request `PENDING`, no row) while an A-vs-B **recompete succeeds after completion**; completed competitions are excluded from the 3-active count (after completing one, the user at 2 active accepts the same opponent again → `200` at 3 active); `GET /competitions` is participant-scoped (A sees only A's competitions, D never sees the A-vs-B one), `?status=active` returns only active with `end_time ASC` (soonest-ending first), `?status=completed` only completed, an invalid status → `422`, and unauthenticated → `401`; `GET /competitions/{id}` stays participant-only (`200` for challenger/opponent, `403` for a third user, `401` unauthenticated); and concurrency — a user at 2 active who accepts two pending requests simultaneously ends with **exactly 3 active** competitions: one `200` + one `409`, one new competition, one request `ACCEPTED` and the other left `PENDING` (serialized by the `FOR UPDATE` user-row locks). All test rows are cleaned up afterward.
 
 ## Seed data
 

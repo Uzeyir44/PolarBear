@@ -19,7 +19,9 @@ hold several PENDING requests to the same opponent at once.
 
 Test users and their competition_requests rows are deleted afterwards so the
 development DB is left clean (user FKs on competition_requests are RESTRICT,
-so requests must be removed before the users).
+so requests must be removed before the users; acceptance also creates a
+competitions row whose FK back to the request is RESTRICT, so competitions are
+removed before requests).
 """
 import time
 import uuid
@@ -35,7 +37,7 @@ from sqlalchemy import or_, select
 
 from app.core.database import SessionLocal
 from app.main import app
-from app.models import CompetitionRequest, User
+from app.models import Competition, CompetitionRequest, User
 
 client = TestClient(app)
 
@@ -72,12 +74,22 @@ def cleanup() -> None:
                     )
                 )
             ).scalars().all()
+            req_ids = [r.request_id for r in reqs]
+            # Accepting a request now creates a competitions row whose FK back
+            # to competition_requests is ondelete RESTRICT, so competitions
+            # must be removed before their requests (votes cascade on delete).
+            if req_ids:
+                comps = db.execute(
+                    select(Competition).where(Competition.request_id.in_(req_ids))
+                ).scalars().all()
+                for c in comps:
+                    db.delete(c)
             for r in reqs:
                 db.delete(r)
         for row in db.execute(select(User).where(User.username.in_(USERS))).scalars().all():
             db.delete(row)
         db.commit()
-    print(f"\nCleaned up {len(USERS)} test user(s) and their requests.")
+    print(f"\nCleaned up {len(USERS)} test user(s) and their competitions/requests.")
 
 
 def user_id_of(db, username: str) -> str:

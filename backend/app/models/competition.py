@@ -8,16 +8,15 @@ from the accepted `competition_requests` row — deliberate
 denormalization, justified because a request's terms are immutable
 history once accepted.
 
-TRIGGER: "one active competition per user" cannot be a plain
-constraint — a user can appear in either the challenger_id or
-opponent_id column across different rows, and Postgres can't
-declaratively index "this value doesn't appear as either column, in
-any row, with status=active." The trigger below rejects the
-INSERT/UPDATE if either party already has another row with an
-'active' status. This is the one rule in the whole schema that isn't
-self-enforcing by table structure alone — it's enforced here, at the
-database level, rather than only in application code, so it holds
-even for writes that bypass the app (admin tools, migrations, etc.).
+ACTIVE-COMPETITION LIMITS: a user may participate in at most 3
+`active` competitions simultaneously, and a given unordered pair of
+users may have at most 1 `active` competition at a time (historical
+completed ones are fine). These cannot be plain constraints — a user
+can appear in either the challenger_id or opponent_id column across
+different rows. They are enforced race-safely at the application
+layer (SELECT ... FOR UPDATE on both participant user rows before
+accepting a request) and backed up by a BEFORE INSERT/UPDATE trigger
+installed on table creation (never applied to the live DB).
 """
 from __future__ import annotations
 
@@ -96,46 +95,77 @@ class Competition(Base):
         return f"<Competition {self.challenger_id} vs {self.opponent_id}>"
 
 
-# --- Trigger: one active competition per user -----------------------------
-# Looks up the 'active' status_id by name so the trigger doesn't hardcode
-# a specific row id from seed data.
+# --- Trigger: active-competition business rules ----------------------------
+# The app enforces these rules race-safely by taking SELECT ... FOR UPDATE row
+# locks on BOTH participant user rows before it accepts a request (see
+# routers/competition_requests.py) — the locks serialize concurrent
+# competition-creation transactions that share a user, which the trigger's
+# own COUNT queries cannot do. The trigger below is a backstop for any write
+# that bypasses the app (admin tools, migrations, a fresh create_all) and is
+# installed only on table creation via DDL events; it was never applied to the
+# live database. Rules enforced (status_name = 'active' competitions only):
+#   1. a user may be a participant in at most 3 active competitions;
+#   2. the same unordered pair may have at most 1 active competition.
 
-_enforce_one_active_competition_fn = DDL("""
-CREATE OR REPLACE FUNCTION enforce_one_active_competition_per_user()
+_enforce_competition_active_limits_fn = DDL("""
+CREATE OR REPLACE FUNCTION enforce_competition_active_limits()
 RETURNS TRIGGER AS $$
 DECLARE
     v_active_status_id SMALLINT;
-    v_conflict_count INTEGER;
+    v_participant RECORD;
+    v_active_count INTEGER;
 BEGIN
     SELECT status_id INTO v_active_status_id
     FROM competition_status WHERE status_name = 'active';
 
-    IF NEW.status_id = v_active_status_id THEN
-        SELECT COUNT(*) INTO v_conflict_count
+    -- Unknown status or a competition not entering 'active': nothing to enforce.
+    IF v_active_status_id IS NULL OR NEW.status_id <> v_active_status_id THEN
+        RETURN NEW;
+    END IF;
+
+    -- Rule 2: at most one active competition per unordered pair.
+    IF EXISTS (
+        SELECT 1 FROM competitions
+        WHERE status_id = v_active_status_id
+          AND competition_id <> NEW.competition_id
+          AND ((challenger_id = NEW.challenger_id AND opponent_id = NEW.opponent_id)
+            OR (challenger_id = NEW.opponent_id AND opponent_id = NEW.challenger_id))
+    ) THEN
+        RAISE EXCEPTION
+            'Users % and % already have an active competition',
+            NEW.challenger_id, NEW.opponent_id
+            USING ERRCODE = '23514';
+    END IF;
+
+    -- Rule 1: each participant may be in at most 3 active competitions.
+    FOR v_participant IN
+        SELECT unnest(ARRAY[NEW.challenger_id, NEW.opponent_id]) AS user_id
+    LOOP
+        SELECT COUNT(*) INTO v_active_count
         FROM competitions
         WHERE status_id = v_active_status_id
           AND competition_id <> NEW.competition_id
-          AND (challenger_id IN (NEW.challenger_id, NEW.opponent_id)
-               OR opponent_id IN (NEW.challenger_id, NEW.opponent_id));
+          AND (challenger_id = v_participant.user_id OR opponent_id = v_participant.user_id);
 
-        IF v_conflict_count > 0 THEN
+        IF v_active_count >= 3 THEN
             RAISE EXCEPTION
-                'User % or % already has an active competition',
-                NEW.challenger_id, NEW.opponent_id
+                'User % already has the maximum of 3 active competitions',
+                v_participant.user_id
                 USING ERRCODE = '23514';
         END IF;
-    END IF;
+    END LOOP;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 """)
 
-_enforce_one_active_competition_trigger = DDL("""
-CREATE TRIGGER trg_enforce_one_active_competition_per_user
+_enforce_competition_active_limits_trigger = DDL("""
+CREATE TRIGGER trg_enforce_competition_active_limits
 BEFORE INSERT OR UPDATE ON competitions
 FOR EACH ROW
-EXECUTE FUNCTION enforce_one_active_competition_per_user();
+EXECUTE FUNCTION enforce_competition_active_limits();
 """)
 
-event.listen(Competition.__table__, "after_create", _enforce_one_active_competition_fn)
-event.listen(Competition.__table__, "after_create", _enforce_one_active_competition_trigger)
+event.listen(Competition.__table__, "after_create", _enforce_competition_active_limits_fn)
+event.listen(Competition.__table__, "after_create", _enforce_competition_active_limits_trigger)

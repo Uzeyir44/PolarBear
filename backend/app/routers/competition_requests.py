@@ -1,6 +1,6 @@
 """
-Competition requests — Phase 6, Part 1. The pre-competition negotiation
-lifecycle ONLY: send, list (incoming/outgoing), accept, decline, cancel.
+Competition requests — Phase 6. The pre-competition negotiation lifecycle:
+send, list (incoming/outgoing), accept, decline, cancel.
 
 Endpoints (all require a valid JWT; participant identity comes only from the
 token via get_current_user(), never from a client-supplied id):
@@ -9,8 +9,46 @@ token via get_current_user(), never from a client-supplied id):
   GET  /competition-requests/incoming            requests sent TO me
   GET  /competition-requests/outgoing            requests sent BY me
   POST /competition-requests/{id}/accept         opponent: PENDING -> ACCEPTED
+                                                 AND creates an ACTIVE competition
   POST /competition-requests/{id}/decline        opponent: PENDING -> DECLINED
   POST /competition-requests/{id}/cancel         challenger: PENDING -> CANCELLED
+
+Acceptance (Part 2)
+-------------------
+Accepting a PENDING request also creates the corresponding `competitions`
+row and both happen in ONE database transaction:
+
+    BEGIN
+        conditional request -> ACCEPTED (status = 'PENDING' guard)
+        INSERT competition (request_id, parties, duration, status = active,
+                            start_time = now; end_time is a DB GENERATED
+                            column, prize_pool/total_votes use the server
+                            defaults 0 and 0, winner_id = NULL)
+    COMMIT           — or ROLLBACK if anything fails
+
+The request can never be left ACCEPTED without its competition, and a
+competition can never exist while its request is still PENDING. Duplicate
+protection is belt-and-braces: the `competitions.request_id` UNIQUE
+constraint guarantees one competition per request, and the conditional
+PENDING UPDATE guarantees that of two concurrent acceptance attempts only
+one ever reaches competition creation.
+
+Active-competition limits (Part 3)
+----------------------------------
+Before inserting the competition the accept path enforces two business rules
+against `status = 'active'` competitions only (completed ones never count):
+
+  1. a user may participate in at most 3 active competitions at a time;
+  2. the same unordered pair may have at most 1 active competition.
+
+Both participants are checked (challenger AND opponent); if either rule
+fails, the accept returns 409 and the request is left PENDING (so it can be
+accepted later, after an active competition completes or the matchup ends) —
+the request is never auto-DECLINED. Concurrency-safety: the accept takes
+SELECT ... FOR UPDATE locks on both participant user rows (sorted, so
+deadlock-free) before any counting, so two simultaneous accepts involving the
+same user serialize on that user's row and a stale active-count read becomes
+impossible. See _enforce_active_rules.
 
 Authorization rules
 -------------------
@@ -45,9 +83,11 @@ accept/decline/cancel use an atomic conditional UPDATE
 (UPDATE ... WHERE status = 'PENDING' ...) and verify exactly one row was
 affected. With READ COMMITTED, Postgres re-evaluates the WHERE against the
 latest committed row version after acquiring the row lock, so if two requests
-race (accept + decline) exactly one wins; the loser sees rowcount == 0 and
-returns 409. No explicit row lock is needed — the conditional update itself
-serializes the transition, the lightest safe option.
+race exactly one wins; the loser sees rowcount == 0 and returns 409. Because
+the competition INSERT only ever runs after the conditional UPDATE reports a
+win for THIS transaction, a lost race never creates a competition row — the
+`request_id` UNIQUE constraint is a second line of defense. No explicit row
+lock is needed — the conditional update itself serializes the transition.
 
 Inactive accounts: following the project's established interpretation,
 get_current_user() 401s inactive users entirely, so an inactive account can
@@ -57,12 +97,13 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import CompetitionRequest, CompetitionRequestStatus, User
+from app.models import Competition, CompetitionRequest, CompetitionRequestStatus, CompetitionStatus, User
 from app.schemas.competition_request import CompetitionRequestCreate, CompetitionRequestRead
 from app.schemas.user import UserPublic
 
@@ -248,9 +289,129 @@ def _transition_request(
         db.rollback()
         raise _no_longer_pending()
 
-    db.commit()
+    # Part 2+3: acceptance also creates the competition. Only the request that
+    # WON the conditional transition above reaches this INSERT, so a lost
+    # concurrent acceptance never produces a competition row. Everything —
+    # the request UPDATE and this INSERT — commits (or rolls back) together.
+    if action == "accept":
+        active_status_id = _active_status_id(db)
+        if active_status_id is None:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Active competition status is not configured",
+            )
+        _enforce_active_rules(
+            db,
+            challenger_id=request.challenger_id,
+            opponent_id=request.opponent_id,
+            active_status_id=active_status_id,
+        )
+        # prize_pool/total_votes use the DB server defaults (0 / 0),
+        # winner_id stays NULL; end_time is a GENERATED
+        # column the database computes from start_time + duration_minutes.
+        db.add(
+            Competition(
+                request_id=request_id,
+                challenger_id=request.challenger_id,
+                opponent_id=request.opponent_id,
+                duration_minutes=request.duration_minutes,
+                start_time=now,
+                status_id=active_status_id,
+            )
+        )
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # The request_id UNIQUE constraint on competitions fired — a
+        # competition for this request already exists (legacy/pre-seeded row).
+        # The whole transaction rolls back, so the request stays PENDING and
+        # the pre-existing competition survives untouched.
+        db.rollback()
+        raise _competition_conflict() from exc
+
     db.refresh(request)
     return _to_request_read(request)
+
+
+def _active_status_id(db: Session) -> int | None:
+    # Resolves the lookup row by name (never hardcoding seed ids), mirroring
+    # how qr.py resolves its coin_transaction_types row.
+    return db.scalar(
+        select(CompetitionStatus.status_id).where(CompetitionStatus.status_name == "active")
+    )
+
+
+def _enforce_active_rules(
+    db: Session,
+    *,
+    challenger_id: uuid.UUID,
+    opponent_id: uuid.UUID,
+    active_status_id: int,
+) -> None:
+    """Serialize and validate active-competition limits for a new competition.
+
+    Concurrency safety: take SELECT ... FOR UPDATE row locks on BOTH
+    participant user rows (in sorted order, so concurrent transactions can
+    never deadlock) BEFORE counting. Every competition-creation transaction
+    follows the same locking protocol, so any accept involving a user is
+    serialized with every other accept involving that same user — a concurrent
+    accept can no longer read a stale active-count. This is the qr.py redeem
+    pattern ("the lock, not the Python check, is what makes it safe").
+
+    Rules enforced (status_id = 'active' only):
+      1. neither participant may already be in 3 active competitions;
+      2. the unordered pair may not already have an active competition.
+    """
+    _lock_participants(db, challenger_id, opponent_id)
+
+    for participant in (challenger_id, opponent_id):
+        active_count = db.scalar(
+            select(func.count())
+            .select_from(Competition)
+            .where(
+                Competition.status_id == active_status_id,
+                or_(
+                    Competition.challenger_id == participant,
+                    Competition.opponent_id == participant,
+                ),
+            )
+        )
+        if active_count >= 3:
+            raise _active_limit_reached()
+
+    matchup_count = db.scalar(
+        select(func.count())
+        .select_from(Competition)
+        .where(
+            Competition.status_id == active_status_id,
+            or_(
+                and_(
+                    Competition.challenger_id == challenger_id,
+                    Competition.opponent_id == opponent_id,
+                ),
+                and_(
+                    Competition.challenger_id == opponent_id,
+                    Competition.opponent_id == challenger_id,
+                ),
+            ),
+        )
+    )
+    if matchup_count:
+        raise _duplicate_active_matchup()
+
+
+def _lock_participants(db: Session, challenger_id: uuid.UUID, opponent_id: uuid.UUID) -> None:
+    # Ordered by user_id so every transaction locks shared users in the same
+    # order — two transactions locking {A, B} and {B, A} both take A's lock
+    # first, which is what makes the protocol deadlock-free.
+    db.execute(
+        select(User.user_id)
+        .where(User.user_id.in_([challenger_id, opponent_id]))
+        .order_by(User.user_id)
+        .with_for_update()
+    )
 
 
 def _to_request_read(request: CompetitionRequest) -> CompetitionRequestRead:
@@ -295,4 +456,25 @@ def _no_longer_pending() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail="Competition request is no longer pending",
+    )
+
+
+def _competition_conflict() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="A competition for this request already exists",
+    )
+
+
+def _active_limit_reached() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="The active competition limit has been reached (maximum 3)",
+    )
+
+
+def _duplicate_active_matchup() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="These users already have an active competition",
     )
