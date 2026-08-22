@@ -1089,7 +1089,7 @@ Rules (all enforced from the JWT identity, never the frontend):
 - **Insufficient balance → `400` "Not enough coins to vote"**: the voter must have at least 1 coin; if not, nothing changes (no vote, no deduction, no ledger row, no count change).
 - Invalid `competition_id` or `voted_for_user_id` (bad UUID) → normal Pydantic `422`.
 
-A successful vote performs ONE atomic business operation — vote, coin deduction, ledger row, and count all commit (or roll back) together:
+A successful vote performs ONE atomic business operation — vote, coin deduction, ledger row, count, and prize-pool growth all commit (or roll back) together:
 
 ```
 BEGIN
@@ -1099,15 +1099,18 @@ BEGIN
          WHERE user_id = :me AND coin_balance >= 1 RETURNING coin_balance
   INSERT coin_transactions             (type = vote_cast / DEBIT, amount = -1,
                                         balance_after, vote_id, competition_id)
-  UPDATE competitions SET total_votes = total_votes + 1
+  UPDATE competitions
+     SET total_votes = total_votes + 1,
+         prize_pool  = prize_pool + 1
 COMMIT  — or ROLLBACK
 ```
 
 - Exactly **1 coin** is deducted (`users.coin_balance` is never allowed to go negative — the guarded UPDATE + the DB `coin_balance >= 0` constraint).
+- The competition's **`prize_pool` grows by exactly 1 coin** in the SAME transaction — the voter's spent coin moves into the pool. A failed/rejected vote (insufficient balance, duplicate, self-vote, invalid target, completed competition, unauthenticated) never changes the prize pool.
 - Exactly **one `coin_transactions` row** is created per successful vote, using the seeded **`vote_cast` / DEBIT** lookup row, with signed **`amount = -1`**, `balance_after` = the post-deduction balance, and the `vote_id` + `competition_id` references.
-- **Invalid requests never spend a coin**: self-votes, invalid targets, completed competitions, unauthenticated requests, duplicates, and insufficient balances all reject before (or atomically without) any deduction.
+- **Invalid requests never spend a coin**: self-votes, invalid targets, completed competitions, unauthenticated requests, duplicates, and insufficient balances all reject before (or atomically without) any deduction, and therefore never grow the prize pool.
 
-Concurrency & atomicity: the balance is decremented with a single atomic conditional `UPDATE … WHERE coin_balance >= 1 … RETURNING` (the `qr.py` pattern) — of two simultaneous vote transactions only one can win the user's last coin; the loser rolls back its whole vote and gets `400`, so a coin can never be spent twice. Duplicate votes don't reach the balance step (the UNIQUE constraint fires on the very first write). The cleared vote row, the deduction, the ledger insert, and the `total_votes` increment commit together — any failure rolls all of them back. Vote target validity is additionally back-stopped by a `votes` trigger in the model (installed only on table creation; a fresh-database constraint violation surfaces as the same `400`).
+Concurrency & atomicity: the balance is decremented with a single atomic conditional `UPDATE … WHERE coin_balance >= 1 … RETURNING` (the `qr.py` pattern) — of two simultaneous vote transactions only one can win the user's last coin; the loser rolls back its whole vote and gets `400`, so a coin can never be spent twice. Duplicate votes don't reach the balance step (the UNIQUE constraint fires on the very first write). The cleared vote row, the deduction, the ledger insert, the `total_votes` increment, and the `prize_pool` increment commit together — any failure rolls all of them back. Vote target validity is additionally back-stopped by a `votes` trigger in the model (installed only on table creation; a fresh-database constraint violation surfaces as the same `400`).
 
 Response (`201 Created`):
 
@@ -1127,8 +1130,8 @@ The response exposes only ids, the timestamp, the updated aggregate count, and t
 
 ### What this part deliberately does NOT do
 
-- Voting is implemented at a fixed cost of **1 coin per vote** (`vote_cast` DEBIT ledger row, `balance_after` recorded) — but no other coin features exist yet: no `prize_pool` growth, no winner/reward payout, no refunds, no QR/clothing changes.
-- Does **not** grow `prize_pool`, compute `winner_id`, or distribute rewards — a vote only bumps `competitions.total_votes` and records `voted_for_user_id` in `votes`.
+- Voting is implemented at a fixed cost of **1 coin per vote** (`vote_cast` DEBIT ledger row, `balance_after` recorded) and each vote **grows the competition's `prize_pool` by 1** — but no payout/winner features exist yet: no winner calculation, no reward/prize distribution, no refunds, no QR/clothing changes.
+- Does **not** compute `winner_id` or distribute the prize pool — each vote only bumps `competitions.total_votes` and `competitions.prize_pool` and records `voted_for_user_id` in `votes`.
 - Does **not** implement `completed` transitions or automatic competition completion (the DB `completed` status exists and is set by tests/admin tooling, but the app has no completion flow yet).
 - Does **not** create any notifications or touch `device_tokens`.
 
@@ -1325,7 +1328,7 @@ venv/Scripts/python -m tests.test_vote_cost
 
 `test_vote_casting.py` verifies the vote mechanics on top of the coin cost (Phase 6, Part 4B): a third-party voter can vote for the **challenger** (`201` with `vote_id`/`created_at`/`total_votes`/`balance_after`) and another for the **opponent** (`201`, `total_votes = 2`); each successful vote creates exactly one `votes` row and bumps stored `total_votes` by exactly 1 (confirmed in the DB); each successful vote spends the voter's single starting coin (C/D end at 0) and writes one `vote_cast` ledger row (2 total); unauthenticated → `401`; the challenger and the opponent voting in their own competition → `400` with no vote row; voting for a non-participant → `400`; a duplicate vote from the same voter → `409` "You have already voted in this competition" with no new row and `total_votes` unchanged (the `UNIQUE(competition_id, voter_id)` constraint is the enforcing layer, so no second coin is spent); two concurrent duplicate votes from one voter → exactly one `201` and one `409`, one vote row, `total_votes` +1 only; and voting in a **completed** competition → `409` with no row and the count unchanged. The deep coin/ledger coverage lives in `test_vote_cost.py`. All test rows (votes → competitions → requests → users) are cleaned up afterward.
 
-`test_vote_cost.py` verifies the vote cost + coin transaction (Phase 6, Part 4B-2): a user with exactly 1 coin and a user with 5 coins can both vote (`201`); each successful vote deducts exactly **1 coin** (`balance_after` 0 and 4 respectively); each writes exactly one `coin_transactions` row with the seeded **`vote_cast` / `DEBIT`** type, signed `amount = -1`, the correct user/vote/competition references, and `balance_after` equal to the stored post-vote balance; the competition `total_votes` increases by exactly 1 per vote; a **0-coin** user trying to vote → `400` "Not enough coins to vote" with no vote, no transaction, unchanged `total_votes` and unchanged balance; a **duplicate** vote → `409` with no second coin spent, no second transaction, and `total_votes` unchanged; **self-votes**, the **invalid target**, a **completed** competition, and an **unauthenticated** request never spend a coin; **atomicity** — temporarily breaking the `vote_cast` lookup forces a mid-transaction `500` that rolls back the vote, the in-flight deduction, and the count (the user's balance is restored); and **concurrency** — a user with exactly 1 coin casting two simultaneous valid votes (in two different competitions) yields exactly one `201` and one `400`, balance `0`, one vote, and one transaction (the guarded `coin_balance >= 1` UPDATE serializes the last coin). All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
+`test_vote_cost.py` verifies the vote cost + coin transaction + prize-pool growth (Phase 6, Part 4B-2): a user with exactly 1 coin and a user with 5 coins can both vote (`201`); each successful vote deducts exactly **1 coin** (`balance_after` 0 and 4 respectively); each writes exactly one `coin_transactions` row with the seeded **`vote_cast` / `DEBIT`** type, signed `amount = -1`, the correct user/vote/competition references, and `balance_after` equal to the stored post-vote balance; the competition `total_votes` and **`prize_pool` each increase by exactly 1 per vote** (0 → 1 → 2, verified for both single and multiple votes) **in the same transaction**; a **0-coin** user trying to vote → `400` "Not enough coins to vote" with no vote, no transaction, unchanged `total_votes`, unchanged prize pool, and unchanged balance; a **duplicate** vote → `409` with no second coin spent, no second transaction, and `total_votes`/`prize_pool` unchanged; **self-votes**, the **invalid target**, a **completed** competition, and an **unauthenticated** request never spend a coin and never grow the prize pool; **atomicity** — temporarily breaking the `vote_cast` lookup forces a mid-transaction `500` that rolls back the vote, the in-flight deduction, the count, and the prize pool (the user's balance is restored); and **concurrency** — a user with exactly 1 coin casting two simultaneous valid votes (in two different competitions) yields exactly one `201` and one `400`, balance `0`, one vote, one transaction, and exactly **+1** to the pools combined (the guarded `coin_balance >= 1` UPDATE serializes the last coin). All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
 
 ## Seed data
 

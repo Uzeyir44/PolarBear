@@ -132,6 +132,11 @@ def total_votes(competition_id: str) -> int:
         return db.get(Competition, uuid.UUID(competition_id)).total_votes
 
 
+def prize_pool(competition_id: str) -> int:
+    with SessionLocal() as db:
+        return db.get(Competition, uuid.UUID(competition_id)).prize_pool
+
+
 def vote_rows(voter_id: str, competition_id: str) -> int:
     with SessionLocal() as db:
         return len(
@@ -219,6 +224,7 @@ try:
     )
     results.append(("user with exactly 1 coin can vote -> 201", ok, str(r.status_code)))
     results.append(("successful vote deducts exactly 1 coin (C 1 -> 0)", balance_of(USERS["C"]) == 0, str(balance_of(USERS["C"]))))
+    results.append(("successful vote grows prize_pool by exactly 1 (0 -> 1)", prize_pool(comp1) == 1, str(prize_pool(comp1))))
     c_vote_id = js["vote_id"]
 
     r = vote(TOKENS["D"], comp1, IDS["B"])
@@ -233,6 +239,7 @@ try:
     results.append(("successful vote deducts exactly 1 coin (D 5 -> 4)", balance_of(USERS["D"]) == 4, str(balance_of(USERS["D"]))))
     d_vote_id = js["vote_id"]
     results.append(("competition vote count increases by exactly 1 per vote", total_votes(comp1) == 2, str(total_votes(comp1))))
+    results.append(("multiple successful votes grow prize_pool correctly (1 + 1 = 2)", prize_pool(comp1) == 2, str(prize_pool(comp1))))
 
     # Ledger rows for C and D.
     c_tx = tx_rows(IDS["C"])
@@ -264,11 +271,13 @@ try:
         and total_votes(comp1) == 2                   # count unchanged
         and vote_rows(IDS["D"], comp1) == 1
     )
-    results.append(("duplicate vote -> 409, no second coin spent", ok, str(r.status_code)))
+    results.append(("duplicate vote -> 409, no second coin spent, prize_pool unchanged", ok,
+                    f"prize={prize_pool(comp1)}"))
 
     # --- 12-17. INSUFFICIENT BALANCE -----------------------------------------------------------
     c_before = balance_of(USERS["C"])                     # 0
     comp2_total_before = total_votes(comp2)               # 0
+    comp2_pool_before = prize_pool(comp2)                 # 0
     r = vote(TOKENS["C"], comp2, IDS["G"])
     ok = (
         r.status_code == 400
@@ -276,6 +285,7 @@ try:
         and vote_rows(IDS["C"], comp2) == 0               # no vote
         and len(tx_rows(IDS["C"])) == 1                   # still only the first vote's tx
         and total_votes(comp2) == comp2_total_before      # count unchanged
+        and prize_pool(comp2) == comp2_pool_before        # prize pool unchanged
         and balance_of(USERS["C"]) == c_before            # balance unchanged (0)
     )
     results.append(("0-coin user cannot vote -> 400 with nothing changed", ok, str(r.status_code)))
@@ -305,8 +315,9 @@ try:
         and balance_of(USERS["E"]) == 0                    # the single coin is spent once
         and (vote_rows(IDS["E"], comp1) + vote_rows(IDS["E"], comp2)) == 1
         and len(tx_rows(IDS["E"])) == 1                    # exactly one vote_cast transaction
+        and (prize_pool(comp1) + prize_pool(comp2)) == 3   # pools grew by exactly 1 (comp1 was 2, comp2 0)
     )
-    results.append(("concurrent votes with 1 coin -> one 201/one 400, one vote, one tx", ok, f"outcomes={outcomes}"))
+    results.append(("concurrent votes with 1 coin -> one 201/one 400, one vote, one tx, +1 pool total", ok, f"outcomes={outcomes} pool={prize_pool(comp1)}+{prize_pool(comp2)}"))
 
     # --- 23. Self-vote never spends coins ------------------------------------------------------------
     a_before = balance_of(USERS["A"])
@@ -320,6 +331,7 @@ try:
 
     # --- 24. Invalid target never spends coins ---------------------------------------------------------
     f_before = balance_of(USERS["F"])
+    comp1_pool_before = prize_pool(comp1)
     r = vote(TOKENS["F"], comp1, IDS["E"])                 # E is not a participant of comp1
     ok = (
         r.status_code == 400
@@ -327,13 +339,15 @@ try:
         and balance_of(USERS["F"]) == f_before
         and len(tx_rows(IDS["F"])) == 0
         and vote_rows(IDS["F"], comp1) == 0
+        and prize_pool(comp1) == comp1_pool_before          # prize pool unchanged
     )
-    results.append(("invalid target -> 400, no coin spent", ok, str(r.status_code)))
+    results.append(("invalid target -> 400, no coin spent, prize_pool unchanged", ok, str(r.status_code)))
 
     # --- 25. Completed competition never spends coins -------------------------------------------------
     mark_completed(comp2)
     f_before = balance_of(USERS["F"])
     comp2_total_before = total_votes(comp2)
+    comp2_pool_before = prize_pool(comp2)
     r = vote(TOKENS["F"], comp2, IDS["G"])
     ok = (
         r.status_code == 409
@@ -342,8 +356,9 @@ try:
         and len(tx_rows(IDS["F"])) == 0
         and vote_rows(IDS["F"], comp2) == 0
         and total_votes(comp2) == comp2_total_before
+        and prize_pool(comp2) == comp2_pool_before
     )
-    results.append(("completed competition -> 409, no coin spent", ok, str(r.status_code)))
+    results.append(("completed competition -> 409, no coin spent, prize_pool unchanged", ok, str(r.status_code)))
 
     # --- 26. Unauthenticated never spends coins -------------------------------------------------------
     d_before = balance_of(USERS["D"])
@@ -353,6 +368,7 @@ try:
 
     # --- 27. ATOMICITY: a mid-transaction failure rolls back vote + spent coin + count --------------
     comp1_total_before = total_votes(comp1)
+    comp1_pool_before = prize_pool(comp1)
     i_before = balance_of(USERS["I"])
     with SessionLocal() as db:
         db.execute(
@@ -375,8 +391,9 @@ try:
         and vote_rows(IDS["I"], comp1) == 0               # no committed vote
         and len(tx_rows(IDS["I"])) == 0                   # no ledger row
         and total_votes(comp1) == comp1_total_before      # count unchanged
+        and prize_pool(comp1) == comp1_pool_before        # prize pool rolled back too
     )
-    results.append(("ledger-type failure rolls back vote + deduction + count (atomicity)", ok, str(r.status_code)))
+    results.append(("ledger-type failure rolls back vote + deduction + count + prize_pool (atomicity)", ok, str(r.status_code)))
 
 finally:
     cleanup()

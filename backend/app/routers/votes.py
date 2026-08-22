@@ -4,7 +4,8 @@ Votes — Phase 6, Part 4B. Vote casting with a 1-coin cost.
   POST /competitions/{competition_id}/votes    cast a vote (201)
 
 A successful vote costs exactly 1 coin (a fixed business rule — no
-configurable price). The whole operation is ONE transaction:
+configurable price) and grows the competition's prize_pool by exactly 1 coin
+in the same transaction. The whole operation is ONE transaction:
 
     BEGIN
       validations                 (competition exists/active, not a
@@ -19,12 +20,14 @@ configurable price). The whole operation is ONE transaction:
       INSERT coin_transactions    (type vote_cast/DEBIT, amount -1,
                                    balance_after, vote_id, competition_id)
       UPDATE competitions
-          SET total_votes = total_votes + 1
+          SET total_votes = total_votes + 1,
+              prize_pool  = prize_pool + 1
     COMMIT  — or ROLLBACK
 
-Atomicity: vote + balance + ledger + vote count commit (or roll back)
-together, so "vote exists but coins not deducted", "coins deducted but no
-vote", "ledger row without a vote", etc. are all impossible.
+Atomicity: vote + balance + ledger + vote count + prize pool commit (or roll
+back) together, so "vote exists but coins not deducted", "coins deducted but
+no vote", "ledger row without a vote", or "prize pool grew without a vote"
+are all impossible.
 
 Concurrency: the balance is decremented with a single atomic conditional
 UPDATE (`coin_balance - 1 ... WHERE coin_balance >= 1`, RETURNING the new
@@ -149,11 +152,17 @@ def cast_vote(
             competition_id=competition_id,
         )
     )
-    # Atomic increment — an UPDATE that adds one, never a Python read-modify-write.
+    # Atomic increments — a single UPDATE that adds one to BOTH the vote count
+    # and the prize pool, never a Python read-modify-write. A successful vote
+    # costs the voter 1 coin and grows the competition's prize_pool by 1, in
+    # the same transaction as the vote + balance + ledger writes.
     db.execute(
         update(Competition)
         .where(Competition.competition_id == competition_id)
-        .values(total_votes=Competition.total_votes + 1)
+        .values(
+            total_votes=Competition.total_votes + 1,
+            prize_pool=Competition.prize_pool + 1,
+        )
     )
 
     db.commit()
