@@ -765,6 +765,127 @@ Error cases: missing/invalid/expired token → `401`; user has no avatar → `40
 
 No schema change was required: the read runs over the existing `avatars`, `avatar_equipment`, `clothing_items`, and `clothing_categories` tables.
 
+## Competition requests (Phase 6, Part 1)
+
+The pre-competition negotiation lifecycle: send a challenge to another user, see the requests addressed to you / sent by you, and **accept**, **decline**, or **cancel** them. This stage only touches the `competition_requests` table — a request is `pending`/`accepted`/`declined`/`cancelled` and has a duration but **no prize pool, no votes, no timer**. Accepting a request does **not** create a competition, does **not** move coins, and does **not** write to `coin_transactions`.
+
+All six endpoints require `Authorization: Bearer <token>`; missing/invalid/expired token → `401`. Inactive accounts are blocked by the existing `get_current_user()` dependency (inactive → `401`), so an inactive user can neither send requests nor act on them.
+
+**Authorization model** — the acting participant is ALWAYS `current_user.user_id` from the JWT, never anything the client sends:
+
+- Sending: the challenger is written by the backend; the client only supplies `opponent_id` + `duration_minutes`. A smuggled `challenger_id`/`status`/`created_at`/`responded_at` in the body is simply ignored.
+- Accept / decline: **only the opponent** (the request's recipient) may act.
+- Cancel: **only the challenger** (the request's sender) may act.
+
+**Status lifecycle** — a request starts `PENDING` and can transition exactly once:
+
+```
+PENDING ──┬── ACCEPTED   (opponent accepts)
+          ├── DECLINED   (opponent declines)
+          └── CANCELLED  (challenger cancels)
+```
+
+Once a request leaves `PENDING` it can never transition again; any further accept/decline/cancel attempt → `409 Conflict` ("Competition request is no longer pending"). `responded_at` stays `NULL` while `PENDING` and is set (naive UTC) on the transition.
+
+**Duplicate / simultaneous pending requests** — deliberately allowed, per the documented `competition_requests` design (no uniqueness constraint): a challenger may hold several `PENDING` requests to the same opponent, and `A→B` + `B→A` can both be `PENDING` at once. When a request is later accepted, a future Phase cancels the other pending requests involving either party in the same transaction.
+
+**Concurrency** — accept/decline/cancel use an atomic conditional UPDATE (`UPDATE … SET status = … WHERE request_id = … AND status = 'PENDING' AND <participant> = me`) and verify exactly one row was affected. Under READ COMMITTED Postgres re-evaluates the `WHERE` against the latest committed row version after acquiring the row lock, so if two requests race (e.g. accept + decline) exactly one wins and the loser gets `409` — the database can never end in an invalid combination. No explicit `SELECT … FOR UPDATE` lock is needed.
+
+### Send a request (`POST /competition-requests`)
+
+Creates a `PENDING` request from the authenticated user to the given opponent. No competition row is created.
+
+Flow:
+1. Authenticate → `401` if missing/invalid/expired token; inactive challenger also `401`.
+2. Pydantic validates the body → `422` on bad input (unrecognized/invalid UUID, or any duration outside `{30, 60, 360, 1440}`).
+3. Opponent must exist → else `404` "User not found".
+4. Opponent must be active → else `400` "Cannot send a request to an inactive user".
+5. `opponent_id == current_user.user_id` → `400` "You cannot challenge yourself".
+6. Insert the request (`challenger_id = current_user.user_id`, `status = PENDING`, `created_at = now()`).
+
+Request body (`CompetitionRequestCreate`):
+
+```json
+{
+  "opponent_id": "8bbf17f2-a7e1-…",
+  "duration_minutes": 30
+}
+```
+
+`duration_minutes` is a `Literal[30, 60, 360, 1440]` — exactly the four values allowed by the `competition_requests` `duration_minutes` check constraint (30/60/360/1440 minutes); any other value, including `0` or negatives, is rejected with `422`.
+
+Response (`201 Created`) — the same `CompetitionRequestRead` shape used by every endpoint below:
+
+```json
+{
+  "request_id": "c9a1f3e0-…",
+  "challenger": {
+    "user_id": "6a1c9f10-…",
+    "username": "polar_bear",
+    "profile_picture_url": "https://…/avatar.png",
+    "biography": "I love cold snacks"
+  },
+  "opponent": {
+    "user_id": "8bbf17f2-a7e1-…",
+    "username": "gummy",
+    "profile_picture_url": null,
+    "biography": null
+  },
+  "duration_minutes": 30,
+  "status": "PENDING",
+  "created_at": "2026-08-22T09:15:00.123456",
+  "responded_at": null
+}
+```
+
+### List incoming requests (`GET /competition-requests/incoming`)
+
+Requests addressed to the authenticated user (`opponent_id == current_user.user_id`). `limit` (default 20, 1–50) / `offset` (default 0) pagination, newest first (`ORDER BY created_at DESC`, tie-broken by `request_id`). Returns an array of the `CompetitionRequestRead` shape above — it includes every status (`PENDING`, `ACCEPTED`, `DECLINED`, `CANCELLED`), so the client can filter. A user can only ever see requests sent to themselves; no `user_id` input exists.
+
+### List outgoing requests (`GET /competition-requests/outgoing`)
+
+Requests sent by the authenticated user (`challenger_id == current_user.user_id`), same pagination/ordering/response shape. A user can only ever see requests they sent themselves.
+
+### Accept a request (`POST /competition-requests/{request_id}/accept`)
+
+Only the **opponent** can accept (anyone else → `403`). The request must still be `PENDING` (else `409`) and exist (else `404`). On success the request becomes `ACCEPTED` with `responded_at` set; **no competition is created**.
+
+Response (`200 OK`): the `CompetitionRequestRead` shape with `"status": "ACCEPTED"` and a non-null `responded_at`.
+
+### Decline a request (`POST /competition-requests/{request_id}/decline`)
+
+Same rules as accept, but acting as the opponent returns `DECLINED`. Response (`200 OK`): the `CompetitionRequestRead` shape with `"status": "DECLINED"` and a non-null `responded_at`.
+
+### Cancel a request (`POST /competition-requests/{request_id}/cancel`)
+
+Same rules, but only the **challenger** may cancel their own outgoing request (else `403`). The request must be `PENDING` (else `409`) and exist (else `404`). Response (`200 OK`): the `CompetitionRequestRead` shape with `"status": "CANCELLED"` and a non-null `responded_at`.
+
+### Error cases
+
+| Case | Status | Detail |
+| --- | --- | --- |
+| Missing/invalid/expired token, or inactive account | `401` | — |
+| Invalid body (bad UUID / disallowed duration / non-int) | `422` | — |
+| Opponent does not exist | `404` | `User not found` |
+| Opponent is inactive | `400` | `Cannot send a request to an inactive user` |
+| Self-challenge | `400` | `You cannot challenge yourself` |
+| Request does not exist | `404` | `Competition request not found` |
+| Wrong participant (accept/decline) | `403` | `You are not the opponent of this request` |
+| Wrong participant (cancel) | `403` | `You are not the challenger of this request` |
+| Request already responded to (any terminal state, or a lost concurrency race) | `409` | `Competition request is no longer pending` |
+
+### Response safety
+
+`CompetitionRequestRead` (`app/schemas/competition_request.py`) embeds the standard public user shape `UserPublic` for both participants — only `user_id`, `username`, `profile_picture_url`, `biography`. `email`, `password_hash`, `coin_balance`, `winning_streak`, `is_active`, `created_at` and other account fields never appear in list or detail responses (verified by both the schemas and the response whitelist).
+
+### What this part deliberately does NOT do
+
+- Does **not** create a `competitions` row on accept.
+- Does **not** touch `users.coin_balance` or `coin_transactions` — there are no coin operations in this feature.
+- Does **not** implement prize pools, voting, vote costs, winner calculation, rewards, competition completion, or (push) notifications — those are separate future Phases.
+
+No migration and no seed data were required: the `competition_requests` table and its status enum already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
+
 ## Security notes
 
 - Passwords are hashed with **Argon2id** via `pwdlib` (`app/core/security.py`), using a reusable `PasswordHasher` so routes never contain hashing logic.
@@ -859,6 +980,14 @@ venv/Scripts/python -m tests.test_wardrobe_equip
 # directions + smuggled query params ignored, UNAVAILABLE equipped item
 # stays visible, response field whitelists with no sensitive data)
 venv/Scripts/python -m tests.test_avatar
+
+# Competition requests end-to-end (401s, successful PENDING send, challenger
+# taken from the JWT not the body, self-challenge 400, missing opponent 404,
+# inactive opponent 400, invalid durations 422, all four valid durations,
+# duplicate PENDING requests allowed, no sensitive user data, incoming/
+# outgoing isolation, accept/decline/cancel role rules 403, terminal-state
+# retries 409, responded_at populated on transition, outsider isolation)
+venv/Scripts/python -m tests.test_competition_requests
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), registration creating exactly one avatar for the new user (linked to the user, with server-generated id and created_at — the one-avatar-per-user invariant), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -892,6 +1021,8 @@ venv/Scripts/python -m tests.test_avatar
 `test_wardrobe_equip.py` verifies equip/unequip end-to-end: missing/invalid/expired token → `401` on both endpoints; a registered user WITHOUT an avatar (registration does not create one) gets an explicit `404` "Avatar not found" instead of a silently created avatar; a valid equip → `200` with exactly the whitelisted fields (`message`, `equipment` → `avatar_id`/`slot`/`equipped_at`/catalog-shaped `item`) and exactly one `avatar_equipment` row with the caller's avatar, the category-derived slot, the owned item, and a server-written `equipped_at`; ownership isolation — user A equipping or unequipping user B's `wardrobe_id` → `404` with neither user's equipment changed; slot determination — items from all six categories (hair/hat/top/bottom/shoes/accessory) always land in their category's slot; replacement — equipping Shirt B over Shirt A in TOP leaves exactly one equipment row (Shirt B) while Shirt A stays owned in `user_wardrobe`; multi-slot coexistence — TOP + BOTTOM + SHOES (+ others) coexist on one avatar; unequip removes only the equipment row and keeps ownership; incorrect unequip — with Shirt A equipped, unequipping Shirt B → `409` "This item is not currently equipped" and Shirt A stays equipped (same for an owned-but-unequipped item); availability independence — an equipped item marked `UNAVAILABLE` stays equipped and can still be unequipped; coin safety — `coin_balance` unchanged and zero new `coin_transactions` rows after all equip/unequip traffic; nonexistent `wardrobe_id` → `404` and malformed uuid → `422` on both endpoints; no sensitive fields anywhere in payloads; and two concurrent HTTP equips of different shirts into TOP end with exactly ONE valid equipment row. All test users, avatars, items, and categories are cleaned up afterward.
 
 `test_avatar.py` verifies the avatar retrieval endpoint: missing/invalid/expired token → `401`; a registered user WITHOUT an avatar gets an explicit `404` "Avatar not found" (no silent creation in a read endpoint); an avatar with nothing equipped → `200` with the correct `avatar_id` and ALL SIX slot keys present and explicitly null; one equipped TOP item (placed through the real wardrobe equip endpoint) appears only in `top` with the correct `item_id`/name/image URL/category slot/server-written `equipped_at` while every other slot stays null; items equipped into all six slots each appear in THEIR OWN slot and never in another's; replacement — after equipping Shirt B over Shirt A in TOP, the payload reports Shirt B and Shirt A's id appears nowhere; user isolation — users A and B with differently equipped avatars each see ONLY their own `avatar_id` and equipment in both directions, and smuggled `?user_id=`/`?avatar_id=` query parameters are ignored entirely; availability independence — an equipped item an admin marks `UNAVAILABLE` stays visible on the avatar with its current status; data safety — the envelope exposes exactly `avatar_id`/`equipment`, the map exactly the six slot keys, occupied slots exactly `equipped_at`/`item`, items match the public catalog shape, and no password/email/auth-provider/balance/streak/biography/username fragments appear anywhere in the payload. Equipment is placed exclusively through the wardrobe equip endpoint so Phase 4 → Phase 5 integration is exercised end to end. All test users, avatars, items, and categories are cleaned up afterward.
+
+`test_competition_requests.py` verifies the competition-request lifecycle (Phase 6, Part 1): unauthenticated → `401` on all six endpoints; a successful send → `201` with `status: "PENDING"`, correct parties, `duration_minutes`, and `responded_at: null`; a body-supplied `challenger_id`/`status` is ignored — the challenger always comes from the JWT; self-challenge → `400`; nonexistent opponent → `404`; inactive opponent → `400` (from any sender); invalid durations (`15`, `120`, `0`, `-30`) → `422` while all four valid durations (`30`/`60`/`360`/`1440`) → `201`; duplicate PENDING requests to the same opponent are allowed (the documented design), each with a distinct `request_id`; responses expose only `request_id`/`challenger`/`opponent`/`duration_minutes`/`status`/`created_at`/`responded_at` where both users are the four-field `UserPublic` shape (no email/password/coin/streak leakage); incoming/outgoing lists are strictly isolated (B sees requests addressed to B, C sees none of A/B's); accept/decline by the opponent and cancel by the challenger → `200` with the terminal status and a populated `responded_at` (verified in both the response and the DB); the wrong party (challenger accepts/declines, opponent cancels, non-participant anything) → `403` with the request left untouched; non-pending requests (ACCEPTED/DECLINED/CANCELLED) reject accept/decline/cancel with `409`, including all invalid cross-transitions; a nonexistent `request_id` → `404`; and an outsider's attempts to accept/decline/cancel another user's request all fail `403` with the state unchanged. All test users and their requests (removed first because the user FKs are `RESTRICT`) are cleaned up afterward.
 
 ## Seed data
 
