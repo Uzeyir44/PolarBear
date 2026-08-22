@@ -282,14 +282,18 @@ try:
     results.append(("repeated sweep returns 0 and never reprocesses completed competitions", ok,
                     f"count={second_sweep}"))
 
-    # --- 8,9. PRIZE POOL + REWARD SAFETY ----------------------------------------------
+    # --- 8,9. PRIZE DISTRIBUTION + POOL PRESERVATION ---------------------------------------
     ok = (
-        pool_wc_before == 3 and comp_state(comps["WC"])["prize_pool"] == 3   # sweep preserved the pool
-        and all_balances() == balances_before
-        and ledger_total() == ledger_before
-        and reward_count() == rewards_before
+        pool_wc_before == 3 and comp_state(comps["WC"])["prize_pool"] == 3   # pool preserved on the comp
+        and all_balances()[USERS["A"]] == 3          # WC winner received the whole 3
+        and all_balances()[USERS["B"]] == 0          # loser unchanged
+        and all_balances()[USERS["C"]] == 2          # draw split
+        and all_balances()[USERS["D"]] == 2          # draw split
+        and all_balances()[USERS["E"]] == 0          # zero-vote draw: nothing
+        and all_balances()[USERS["F"]] == 0
+        and reward_count() - rewards_before == 3     # one competition_reward row per recipient
     )
-    results.append(("sweep preserves prize_pool, no balance/ledger/reward changes", ok, ""))
+    results.append(("sweep distributes prize atomically (winner +pool, draw split, zero-vote none)", ok, ""))
 
 finally:
     cleanup()

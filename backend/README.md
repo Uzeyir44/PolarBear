@@ -1147,7 +1147,7 @@ Winner determination — the participant who received **more** `votes.voted_for_
 Completion behavior:
 
 - Sets `status_id` → `completed` and records `winner_id` (or `NULL` for a draw).
-- **Preserves** the final `total_votes` and `prize_pool` — completion does **not** modify coins, `coin_balance`, the ledger, or the prize pool.
+- **Preserves** the final `total_votes` and `prize_pool` on the competition row while **distributing** that pool to the result's recipient(s) (winner 100%, or a 50/50 draw split) via `competition_reward` CREDIT transactions — see "Automatic prize distribution" below.
 - **Idempotent-by-rejection**: completing an already-`completed` competition → `409` "Competition is already completed" with no recompute and no state change.
 - A competition that has **not reached `end_time`** → `409` "Competition has not finished yet", stays `ACTIVE`.
 - After completion **no further votes are accepted** (`409` "Competition is no longer active" — the vote endpoint's final write is guarded on `status = active`, so a vote racing completion either lands before the winner is counted or is rolled back).
@@ -1173,14 +1173,20 @@ Response (`200 OK`) — the same safe `CompetitionRead` shape used everywhere (p
 }
 ```
 
-Business rule (result only — distribution is **not** implemented yet): the **winner** will later receive the prize pool, and on a **draw** both participants will eventually receive half. **Prize distribution is NOT implemented in this feature** — no `competition_reward` transaction, no coin credit, no splitting.
+Automatic prize distribution (Phase 6, Part 4D): the prize pool is distributed **automatically and atomically** as part of competition completion (both the automatic expiration sweep and this manual endpoint share the same completion service):
+
+- **Winner** (`winner_id != NULL`): the winner receives **100% of `prize_pool`** — `coin_balance += prize_pool` and one **`competition_reward` CREDIT** `coin_transactions` row (`amount = +prize_pool`, `balance_after` = the new balance, `competition_id` set).
+- **Draw** (`winner_id = NULL`): the pool is **split equally** between the two participants (`prize_pool / 2` each) — two `competition_reward` CREDIT rows. (Since `prize_pool = total_votes` and one vote adds one coin, a draw's pool is always even.)
+- **Zero-vote draw** (`prize_pool = 0`): **nothing is distributed** — no transactions, no balance changes.
+
+Every distributed coin is backed by a `competition_reward` CREDIT ledger row; `users.coin_balance` is only ever moved through atomic `UPDATE … RETURNING` increments in the same transaction as the ledger insert. **Double payout is impossible**: the payout happens only inside the `SELECT … FOR UPDATE`-guarded ACTIVE → COMPLETED transition, so concurrent or repeated completion attempts (sweep or manual) see the already-`completed` status and pay out zero. A crash mid-transaction rolls the status change and the payout back together.
 
 Errors: missing/invalid/expired token → `401`; competition not found → `404`; non-participant → `403`; already completed / not active / not yet finished → `409`.
 
 ### What this part deliberately does NOT do
 
 - Voting is implemented at a fixed cost of **1 coin per vote** (`vote_cast` DEBIT ledger row, `balance_after` recorded) and each vote **grows the competition's `prize_pool` by 1**.
-- Competition **completion + winner calculation** are implemented (`POST /competitions/{id}/complete`) — but **prize distribution is NOT**: no winner `coin_balance` credit, no `competition_reward` transactions, no draw splitting, no refunds. The prize pool is simply preserved on the competition until the next feature (Phase 4D).
+- Competition **completion + winner calculation + automatic prize distribution** are implemented (`POST /competitions/{id}/complete` and the automatic expiration sweeper): the winner gets the full pool (or the pair splits it on a draw) via `competition_reward` CREDIT ledger rows. Not implemented yet: notifications, refunds, admin competition management, and any other coin features.
 - Does **not** create any notifications or touch `device_tokens`.
 
 No migration was required: the `competitions` and `competition_status` tables (with their `active`/`completed` seed rows) already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
@@ -1338,17 +1344,25 @@ venv/Scripts/python -m tests.test_vote_cost
 # 200 completed with winner = majority participant, total_votes/prize_pool
 # preserved; exact tie (incl. 0 vs 0) -> winner_id NULL; already-completed ->
 # 409 with no recompute/corruption; completed competition rejects further
-# votes -> 409 with counts unchanged; completion changes no balances / no
-# ledger / no competition_reward; non-participant -> 403)
+# votes -> 409 with counts unchanged; prize distributed atomically on
+# completion (winner +pool / draw split / zero-vote none); non-participant
+# -> 403)
 venv/Scripts/python -m tests.test_competition_completion
 
 # Automatic competition expiration end-to-end (a single sweep finalizes every
 # expired ACTIVE competition with correct winner/draw via the shared completion
 # service; a not-yet-expired competition stays ACTIVE; a repeated sweep returns
 # 0 and never reprocesses; auto-completed competitions reject further votes;
-# the sweep preserves prize_pool and changes no balances / no ledger / no
-# competition_reward)
+# the sweep preserves prize_pool and distributes it via competition_reward
+# CREDIT rows)
 venv/Scripts/python -m tests.test_competition_expiration
+
+# Prize distribution end-to-end (Phase 4D: winner receives 100% of the pool via
+# one competition_reward CREDIT row, draw splits equally into two rows, zero-vote
+# draw distributes nothing, every awarded coin has a ledger row, concurrent
+# completions pay exactly once, repeated re-completion never pays again, and a
+# mid-payout failure rolls back completion + payout atomically)
+venv/Scripts/python -m tests.test_prize_distribution
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), registration creating exactly one avatar for the new user (linked to the user, with server-generated id and created_at — the one-avatar-per-user invariant), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -1395,9 +1409,11 @@ venv/Scripts/python -m tests.test_competition_expiration
 
 `test_vote_cost.py` verifies the vote cost + coin transaction + prize-pool growth (Phase 6, Part 4B-2): a user with exactly 1 coin and a user with 5 coins can both vote (`201`); each successful vote deducts exactly **1 coin** (`balance_after` 0 and 4 respectively); each writes exactly one `coin_transactions` row with the seeded **`vote_cast` / `DEBIT`** type, signed `amount = -1`, the correct user/vote/competition references, and `balance_after` equal to the stored post-vote balance; the competition `total_votes` and **`prize_pool` each increase by exactly 1 per vote** (0 → 1 → 2, verified for both single and multiple votes) **in the same transaction**; a **0-coin** user trying to vote → `400` "Not enough coins to vote" with no vote, no transaction, unchanged `total_votes`, unchanged prize pool, and unchanged balance; a **duplicate** vote → `409` with no second coin spent, no second transaction, and `total_votes`/`prize_pool` unchanged; **self-votes**, the **invalid target**, a **completed** competition, and an **unauthenticated** request never spend a coin and never grow the prize pool; **atomicity** — temporarily breaking the `vote_cast` lookup forces a mid-transaction `500` that rolls back the vote, the in-flight deduction, the count, and the prize pool (the user's balance is restored); and **concurrency** — a user with exactly 1 coin casting two simultaneous valid votes (in two different competitions) yields exactly one `201` and one `400`, balance `0`, one vote, one transaction, and exactly **+1** to the pools combined (the guarded `coin_balance >= 1` UPDATE serializes the last coin). All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
 
-`test_competition_completion.py` verifies competition completion + winner calculation (Phase 6, Part 4C): completing an **ACTIVE, not-yet-finished** competition → `409` "Competition has not finished yet" and the competition stays `ACTIVE`; after the `end_time` has passed (emulated by back-dating `start_time`) → `200` `completed` with `winner_id` = the **challenger** when the challenger has more votes (2 vs 1), = the **opponent** when the opponent has more (1 vs 2), and `null` on an **exact tie** (2 vs 2) and on a **zero-vote** competition (0 vs 0, `prize_pool` 0); completing again → `409` "Competition is already completed" with the state byte-for-byte unchanged (no recompute, no corruption); a **completed** competition rejects a further vote → `409` with `total_votes`/`prize_pool` unchanged; completion **preserves** `total_votes` and `prize_pool`, changes **no** coin balances, writes **no** ledger rows, and creates **no** `competition_reward` transaction (distribution is the next feature); every winner is one of the two participants and every draw has `winner_id null`; and a **non-participant** cannot complete a competition → `403` with no state change. All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
+`test_competition_completion.py` verifies competition completion + winner calculation (Phase 6, Part 4C): completing an **ACTIVE, not-yet-finished** competition → `409` "Competition has not finished yet" and the competition stays `ACTIVE`; after the `end_time` has passed (emulated by back-dating `start_time`) → `200` `completed` with `winner_id` = the **challenger** when the challenger has more votes (2 vs 1), = the **opponent** when the opponent has more (1 vs 2), and `null` on an **exact tie** (2 vs 2) and on a **zero-vote** competition (0 vs 0, `prize_pool` 0); completing again → `409` "Competition is already completed" with the state byte-for-byte unchanged (no recompute, no corruption); a **completed** competition rejects a further vote → `409` with `total_votes`/`prize_pool` unchanged; completion **preserves** `total_votes` and `prize_pool` on the row while **distributing** them atomically (the winners/getters receive credits — see `test_prize_distribution.py`); every winner is one of the two participants and every draw has `winner_id null`; and a **non-participant** cannot complete a competition → `403` with no state change. All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
 
-`test_competition_expiration.py` verifies the automatic completion sweeper (Phase 6, Part 4C follow-up): a single `sweep_expired_competitions()` pass finalizes **multiple** expired ACTIVE competitions at once (challenger-wins, draw, and zero-vote draw all correct; `winner_id null` for ties); a competition that **has not reached `end_time` stays `ACTIVE`** through the sweep; an **already-completed** competition is never reprocessed (a repeated sweep returns `0` and the winner is not recomputed); an auto-completed competition **rejects further votes** with `409` and nothing changes; and the sweep **preserves `prize_pool`**, changes **no** coin balances, writes **no** ledger rows, and creates **no** `competition_reward` transactions. The tests drive the shared sweep function directly (the FastAPI lifespan thread that calls it periodically is not started by the TestClient). All test rows are cleaned up afterward.
+`test_competition_expiration.py` verifies the automatic completion sweeper (Phase 6, Part 4C follow-up): a single `sweep_expired_competitions()` pass finalizes **multiple** expired ACTIVE competitions at once (challenger-wins, draw, and zero-vote draw all correct; `winner_id null` for ties); a competition that **has not reached `end_time` stays `ACTIVE`** through the sweep; an **already-completed** competition is never reprocessed (a repeated sweep returns `0` and the winner is not recomputed); an auto-completed competition **rejects further votes** with `409` and nothing changes; and the sweep **preserves `prize_pool`** on each competition and **distributes** it (winner +pool, draw split, zero-vote nothing). The tests drive the shared sweep function directly (the FastAPI lifespan thread that calls it periodically is not started by the TestClient). All test rows are cleaned up afterward.
+
+`test_prize_distribution.py` verifies automatic prize distribution (Phase 6, Part 4D): after automatic completion, a **winner receives 100% of the prize pool** (`coin_balance` + full pool, one `competition_reward` CREDIT transaction with positive `amount`, correct `balance_after`, and the right `competition_id`); an **opponent winner** receives the whole pool; a **draw splits the pool equally** into two reward transactions; a **zero-vote draw** (`prize_pool = 0`) changes nothing and writes no transactions; every distributed coin has a matching `competition_reward` CREDIT ledger row; **concurrent** completion attempts pay the same prize **exactly once** (one `200`/one `409`, single transaction); **double payout is impossible** — a repeated sweep returns `0`, a direct re-completion returns `ALREADY_COMPLETED`, the manual endpoint `409`s, and balances/transaction counts are unchanged; and an **atomic failure** (breaking the `competition_reward` lookup mid-payout) rolls back the completion and **all** payout changes — the competition stays `ACTIVE`, no partial credits or ledger rows remain — after which a later sweep completes it and pays exactly once. All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
 
 ## Seed data
 

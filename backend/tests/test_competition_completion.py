@@ -345,10 +345,25 @@ try:
     )
     results.append(("completed competition rejects further votes -> 409, nothing changes", ok, str(r.status_code)))
 
-    # --- PRIZE POOL + REWARD SAFETY -----------------------------------------------------------
+    # --- PRIZE DISTRIBUTION (Phase 4D) + POOL PRESERVATION ------------------------------------
     balances_after = all_balances()
-    ok = balances_after == balances_before and ledger_total() == ledger_before and reward_count() == rewards_before
-    results.append(("completion changed no coin balances, no ledger rows, no competition_reward", ok, ""))
+    ok = (
+        balances_after[USERS["A"]] == 3          # WC winner: 0 + 3 pool
+        and balances_after[USERS["B"]] == 0      # WC loser unchanged
+        and balances_after[USERS["D"]] == 3      # WO winner: 0 + 3
+        and balances_after[USERS["C"]] == 0      # WO loser unchanged
+        and balances_after[USERS["E"]] == 2      # draw split: 0 + 2
+        and balances_after[USERS["F"]] == 2      # draw split: 0 + 2
+        and balances_after[USERS["G"]] == 0      # zero-vote draw: nothing
+        and balances_after[USERS["H"]] == 0
+        and reward_count() - rewards_before == 4   # 1 + 1 + 2 competition_reward rows
+    )
+    results.append(("prize distributed atomically with completion (winner +pool, draw split, zero-vote none)", ok,
+                    f"A={balances_after.get(USERS['A'])} B={balances_after.get(USERS['B'])} "
+                    f"C={balances_after.get(USERS['C'])} D={balances_after.get(USERS['D'])} "
+                    f"E={balances_after.get(USERS['E'])} F={balances_after.get(USERS['F'])} "
+                    f"G={balances_after.get(USERS['G'])} H={balances_after.get(USERS['H'])} "
+                    f"rewards_delta={reward_count() - rewards_before}"))
 
     # --- NON-PARTICIPANT -----------------------------------------------------------------------
     before = comp_state(comps["WO"])

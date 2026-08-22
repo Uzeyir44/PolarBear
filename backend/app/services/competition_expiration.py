@@ -31,13 +31,15 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
-from app.models import Competition, CompetitionStatus, Vote
+from app.models import CoinTransaction, CoinTransactionType, Competition, CompetitionStatus, User, Vote
 
 logger = logging.getLogger(__name__)
+
+_REWARD_TYPE_NAME = "competition_reward"
 
 
 def resolve_status_id(db: Session, status_name: str) -> int:
@@ -78,13 +80,25 @@ class CompletionOutcome(enum.Enum):
 def complete_expired_competition(
     db: Session, competition_id: uuid.UUID
 ) -> tuple[CompletionOutcome, Competition | None]:
-    """Complete a competition IF it is ACTIVE and its end_time has passed.
+    """Complete a competition IF it is ACTIVE and its end_time has passed, and
+    distribute its prize pool atomically (Phase 6, Part 4D).
 
-    One atomic transition: winner calculation + status -> completed, preserving
-    total_votes and prize_pool. Returns the outcome for the caller to react to
-    (the manual endpoint maps it to HTTP errors; the sweeper skips everything
-    other than COMPLETED). Safe to run repeatedly: an already-completed
-    competition returns ALREADY_COMPLETED with no state change.
+    ONE transaction: winner calculation + status -> completed + prize payout
+    (balance credits + competition_reward CREDIT ledger rows). total_votes and
+    prize_pool are preserved on the competition.
+
+    Payout:
+      * a winner (winner_id != NULL) receives 100% of the prize pool;
+      * a draw (winner_id == NULL) splits the pool equally between the two
+        participants (the pool is always even = total_votes);
+      * a zero-vote draw (prize_pool == 0) distributes nothing.
+
+    Double-payout protection: the prize is ONLY distributed inside the guarded
+    ACTIVE -> COMPLETED status transition, which is serialized by the SELECT
+    ... FOR UPDATE row lock. A concurrent or repeated completion sees status =
+    completed and returns ALREADY_COMPLETED without touching balances; a crash
+    mid-transaction rolls the status change AND the payout back together, so
+    "completed but never paid" and "paid twice" are both impossible.
     """
     active_id = resolve_status_id(db, "active")
     completed_id = resolve_status_id(db, "completed")
@@ -124,9 +138,86 @@ def complete_expired_competition(
 
     competition.status_id = completed_id
     competition.winner_id = winner_id
+    _distribute_prize(db, competition)
     db.commit()
 
     return CompletionOutcome.COMPLETED, competition
+
+
+def _distribute_prize(db: Session, competition: Competition) -> None:
+    """Credit the prize pool to the winner (or split it on a draw).
+
+    Called only in the ACTIVE -> COMPLETED transition, before db.commit(), so
+    the credits + ledger rows commit (or roll back) with the completion itself.
+    Uses atomic `coin_balance = coin_balance + n RETURNING` updates and one
+    positive competition_reward / CREDIT ledger row per recipient (balance_after
+    from the RETURNING value) — the same pattern qr.py uses to credit coins.
+    """
+    prize = competition.prize_pool
+    if prize <= 0:
+        return  # zero-vote draw: nothing to distribute
+
+    reward_type_id = db.scalar(
+        select(CoinTransactionType.type_id).where(
+            CoinTransactionType.type_name == _REWARD_TYPE_NAME
+        )
+    )
+    if reward_type_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Competition reward transaction type is not configured",
+        )
+
+    if competition.winner_id is not None:
+        _credit(
+            db,
+            user_id=competition.winner_id,
+            amount=prize,
+            reward_type_id=reward_type_id,
+            competition_id=competition.competition_id,
+        )
+    else:
+        # Draw: prize_pool == total_votes, always even.
+        half = prize // 2
+        _credit(
+            db,
+            user_id=competition.challenger_id,
+            amount=half,
+            reward_type_id=reward_type_id,
+            competition_id=competition.competition_id,
+        )
+        _credit(
+            db,
+            user_id=competition.opponent_id,
+            amount=half,
+            reward_type_id=reward_type_id,
+            competition_id=competition.competition_id,
+        )
+
+
+def _credit(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    amount: int,
+    reward_type_id: int,
+    competition_id: uuid.UUID,
+) -> None:
+    new_balance = db.execute(
+        update(User)
+        .where(User.user_id == user_id)
+        .values(coin_balance=User.coin_balance + amount)
+        .returning(User.coin_balance)
+    ).scalar_one()
+    db.add(
+        CoinTransaction(
+            user_id=user_id,
+            type_id=reward_type_id,
+            amount=amount,  # positive = CREDIT
+            balance_after=new_balance,
+            competition_id=competition_id,
+        )
+    )
 
 
 def sweep_expired_competitions(db: Session) -> int:
