@@ -22,6 +22,7 @@ in the same transaction. The whole operation is ONE transaction:
       UPDATE competitions
           SET total_votes = total_votes + 1,
               prize_pool  = prize_pool + 1
+          WHERE competition_id = :id AND status_id = <active>
     COMMIT  — or ROLLBACK
 
 Atomicity: vote + balance + ledger + vote count + prize pool commit (or roll
@@ -38,6 +39,11 @@ one wins the guarded decrement; the other sees `coin_balance >= 1` fail,
 rolls back its vote entirely, and returns the insufficient-coins error.
 Duplicate votes (same voter, same competition) are gated by the UNIQUE
 constraint on the FIRST write (the vote INSERT), before any balance change.
+The final competition UPDATE is additionally guarded on `status_id = active`:
+if a /complete request finalizes the competition between this vote's status
+read and its final write, the UPDATE affects 0 rows and the whole vote rolls
+back (the competition can never accept & count a vote its winner calculation
+did not see).
 
 Validation ordering: everything that can reject the request (self-vote,
 invalid target, completed competition, duplicate) happens BEFORE the balance
@@ -78,7 +84,8 @@ def cast_vote(
     if competition is None:
         raise _competition_not_found()
 
-    if competition.status_id != _active_status_id(db):
+    active_status_id = _active_status_id(db)
+    if competition.status_id != active_status_id:
         raise _not_active()
 
     # Self-voting: the voter's identity comes ONLY from the JWT. A participant
@@ -156,14 +163,24 @@ def cast_vote(
     # and the prize pool, never a Python read-modify-write. A successful vote
     # costs the voter 1 coin and grows the competition's prize_pool by 1, in
     # the same transaction as the vote + balance + ledger writes.
-    db.execute(
+    # status_id = active guard: a competition finalized by /complete in between
+    # our read and this write (i.e. a vote racing completion) gets 0 rows here,
+    # and the whole vote rolls back — a completed competition can never accept
+    # a late vote that the winner calculation did not see.
+    result = db.execute(
         update(Competition)
-        .where(Competition.competition_id == competition_id)
+        .where(
+            Competition.competition_id == competition_id,
+            Competition.status_id == active_status_id,
+        )
         .values(
             total_votes=Competition.total_votes + 1,
             prize_pool=Competition.prize_pool + 1,
         )
     )
+    if result.rowcount == 0:
+        db.rollback()
+        raise _not_active()
 
     db.commit()
     db.refresh(competition)

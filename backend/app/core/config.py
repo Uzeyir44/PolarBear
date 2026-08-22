@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     # "exp" claim expires and the client must log in again.
     access_token_expire_minutes: int = 30
 
+    # How often the background competition-expiration sweeper checks PostgreSQL
+    # for ACTIVE competitions whose end_time has passed. Seconds.
+    auto_complete_interval_seconds: int = 30
+
     model_config = SettingsConfigDict(env_file=".env")
 
 

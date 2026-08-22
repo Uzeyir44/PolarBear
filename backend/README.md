@@ -1128,11 +1128,59 @@ Response (`201 Created`):
 
 The response exposes only ids, the timestamp, the updated aggregate count, and the voter's resulting `balance_after` (the same convention as QR redemption's `balance`) — no password/account/coin-history data. Individual vote identities (who voted for whom) are never exposed by any endpoint.
 
+### Complete a competition (`POST /competitions/{competition_id}/complete`)
+
+Automatic expiration: in **normal operation competitions are finalized automatically by the backend** — a lightweight background thread (`app/services/competition_expiration.py`) periodically (default every 30 seconds) sweeps PostgreSQL for ACTIVE competitions whose `end_time` has been reached and finalizes them: winner/draw is calculated and `status` becomes `completed`. **The mobile client does not need to call this endpoint** during normal operation; it is kept as a manual/admin-style completion trigger.
+
+Both the automatic sweeper and this endpoint share the **same** completion service (`complete_expired_competition`), so winner/draw determination and all guards are identical; the sweeper never double-completes (a repeated sweep skips already-`completed` competitions) and races safely with voting and with a concurrent manual completion via the `SELECT … FOR UPDATE` row lock.
+
+This endpoint manually finalizes an **expired, ACTIVE** competition and records its result. Requires `Authorization: Bearer <token>`; missing/invalid/expired token → `401`. Only the **two participants** (challenger **or** opponent) can complete their own competition — any other authenticated user → `403` "You are not a participant of this competition".
+
+Purpose: the backend (never the mobile client) decides when a competition has ended — a competition is completeable only once its `end_time` has been reached, and voting stops when it is finalized.
+
+Winner determination — the participant who received **more** `votes.voted_for_user_id` votes wins:
+
+- Challenger won → `winner_id` = challenger.
+- Opponent won → `winner_id` = opponent.
+- **Draw** — exact tie (including `0` vs `0`) → `winner_id = NULL`. The competition still becomes `completed` (no extra "draw" status; the nullable `winner_id` carries the tie). With `prize_pool = total_votes`, a draw implies an even pool.
+
+Completion behavior:
+
+- Sets `status_id` → `completed` and records `winner_id` (or `NULL` for a draw).
+- **Preserves** the final `total_votes` and `prize_pool` — completion does **not** modify coins, `coin_balance`, the ledger, or the prize pool.
+- **Idempotent-by-rejection**: completing an already-`completed` competition → `409` "Competition is already completed" with no recompute and no state change.
+- A competition that has **not reached `end_time`** → `409` "Competition has not finished yet", stays `ACTIVE`.
+- After completion **no further votes are accepted** (`409` "Competition is no longer active" — the vote endpoint's final write is guarded on `status = active`, so a vote racing completion either lands before the winner is counted or is rolled back).
+
+Request body: none.
+
+Response (`200 OK`) — the same safe `CompetitionRead` shape used everywhere (participants are the four-field `UserPublic` shape; `status` is now `"completed"`, `winner_id` is the winner's id or `null`):
+
+```json
+{
+  "competition_id": "3f0a1c55-…",
+  "request_id": "c9a1f3e0-…",
+  "challenger": { "user_id": "6a1c9f10-…", "username": "polar_bear", "profile_picture_url": "…", "biography": "…" },
+  "opponent": { "user_id": "8bbf17f2-…", "username": "gummy", "profile_picture_url": null, "biography": null },
+  "status": "completed",
+  "prize_pool": 20,
+  "total_votes": 20,
+  "winner_id": "6a1c9f10-…",
+  "duration_minutes": 60,
+  "start_time": "2026-08-22T09:15:00.123456",
+  "end_time": "2026-08-22T10:15:00.123456",
+  "created_at": "2026-08-22T09:15:00.123456"
+}
+```
+
+Business rule (result only — distribution is **not** implemented yet): the **winner** will later receive the prize pool, and on a **draw** both participants will eventually receive half. **Prize distribution is NOT implemented in this feature** — no `competition_reward` transaction, no coin credit, no splitting.
+
+Errors: missing/invalid/expired token → `401`; competition not found → `404`; non-participant → `403`; already completed / not active / not yet finished → `409`.
+
 ### What this part deliberately does NOT do
 
-- Voting is implemented at a fixed cost of **1 coin per vote** (`vote_cast` DEBIT ledger row, `balance_after` recorded) and each vote **grows the competition's `prize_pool` by 1** — but no payout/winner features exist yet: no winner calculation, no reward/prize distribution, no refunds, no QR/clothing changes.
-- Does **not** compute `winner_id` or distribute the prize pool — each vote only bumps `competitions.total_votes` and `competitions.prize_pool` and records `voted_for_user_id` in `votes`.
-- Does **not** implement `completed` transitions or automatic competition completion (the DB `completed` status exists and is set by tests/admin tooling, but the app has no completion flow yet).
+- Voting is implemented at a fixed cost of **1 coin per vote** (`vote_cast` DEBIT ledger row, `balance_after` recorded) and each vote **grows the competition's `prize_pool` by 1**.
+- Competition **completion + winner calculation** are implemented (`POST /competitions/{id}/complete`) — but **prize distribution is NOT**: no winner `coin_balance` credit, no `competition_reward` transactions, no draw splitting, no refunds. The prize pool is simply preserved on the competition until the next feature (Phase 4D).
 - Does **not** create any notifications or touch `device_tokens`.
 
 No migration was required: the `competitions` and `competition_status` tables (with their `active`/`completed` seed rows) already existed in `310bd16d3308_initial_schema.py`, and the models already matched the database (`alembic check` reports no pending operations).
@@ -1284,6 +1332,23 @@ venv/Scripts/python -m tests.test_vote_casting
 # deduction + count atomically; 1-coin user racing two simultaneous valid
 # votes -> one 201/one 400, exactly one vote and one transaction)
 venv/Scripts/python -m tests.test_vote_cost
+
+# Competition completion + winner calculation end-to-end (cannot complete an
+# ACTIVE unfinished competition -> 409, stays active; expired competition ->
+# 200 completed with winner = majority participant, total_votes/prize_pool
+# preserved; exact tie (incl. 0 vs 0) -> winner_id NULL; already-completed ->
+# 409 with no recompute/corruption; completed competition rejects further
+# votes -> 409 with counts unchanged; completion changes no balances / no
+# ledger / no competition_reward; non-participant -> 403)
+venv/Scripts/python -m tests.test_competition_completion
+
+# Automatic competition expiration end-to-end (a single sweep finalizes every
+# expired ACTIVE competition with correct winner/draw via the shared completion
+# service; a not-yet-expired competition stays ACTIVE; a repeated sweep returns
+# 0 and never reprocesses; auto-completed competitions reject further votes;
+# the sweep preserves prize_pool and changes no balances / no ledger / no
+# competition_reward)
+venv/Scripts/python -m tests.test_competition_expiration
 ```
 
 `test_register.py` currently verifies: successful registration, password stored as an Argon2 hash (not plain text), registration creating exactly one avatar for the new user (linked to the user, with server-generated id and created_at — the one-avatar-per-user invariant), duplicate username rejected, duplicate email rejected (case-insensitively), invalid payloads rejected by Pydantic, and no password/hash leakage in responses. All test users are cleaned up afterward.
@@ -1329,6 +1394,10 @@ venv/Scripts/python -m tests.test_vote_cost
 `test_vote_casting.py` verifies the vote mechanics on top of the coin cost (Phase 6, Part 4B): a third-party voter can vote for the **challenger** (`201` with `vote_id`/`created_at`/`total_votes`/`balance_after`) and another for the **opponent** (`201`, `total_votes = 2`); each successful vote creates exactly one `votes` row and bumps stored `total_votes` by exactly 1 (confirmed in the DB); each successful vote spends the voter's single starting coin (C/D end at 0) and writes one `vote_cast` ledger row (2 total); unauthenticated → `401`; the challenger and the opponent voting in their own competition → `400` with no vote row; voting for a non-participant → `400`; a duplicate vote from the same voter → `409` "You have already voted in this competition" with no new row and `total_votes` unchanged (the `UNIQUE(competition_id, voter_id)` constraint is the enforcing layer, so no second coin is spent); two concurrent duplicate votes from one voter → exactly one `201` and one `409`, one vote row, `total_votes` +1 only; and voting in a **completed** competition → `409` with no row and the count unchanged. The deep coin/ledger coverage lives in `test_vote_cost.py`. All test rows (votes → competitions → requests → users) are cleaned up afterward.
 
 `test_vote_cost.py` verifies the vote cost + coin transaction + prize-pool growth (Phase 6, Part 4B-2): a user with exactly 1 coin and a user with 5 coins can both vote (`201`); each successful vote deducts exactly **1 coin** (`balance_after` 0 and 4 respectively); each writes exactly one `coin_transactions` row with the seeded **`vote_cast` / `DEBIT`** type, signed `amount = -1`, the correct user/vote/competition references, and `balance_after` equal to the stored post-vote balance; the competition `total_votes` and **`prize_pool` each increase by exactly 1 per vote** (0 → 1 → 2, verified for both single and multiple votes) **in the same transaction**; a **0-coin** user trying to vote → `400` "Not enough coins to vote" with no vote, no transaction, unchanged `total_votes`, unchanged prize pool, and unchanged balance; a **duplicate** vote → `409` with no second coin spent, no second transaction, and `total_votes`/`prize_pool` unchanged; **self-votes**, the **invalid target**, a **completed** competition, and an **unauthenticated** request never spend a coin and never grow the prize pool; **atomicity** — temporarily breaking the `vote_cast` lookup forces a mid-transaction `500` that rolls back the vote, the in-flight deduction, the count, and the prize pool (the user's balance is restored); and **concurrency** — a user with exactly 1 coin casting two simultaneous valid votes (in two different competitions) yields exactly one `201` and one `400`, balance `0`, one vote, one transaction, and exactly **+1** to the pools combined (the guarded `coin_balance >= 1` UPDATE serializes the last coin). All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
+
+`test_competition_completion.py` verifies competition completion + winner calculation (Phase 6, Part 4C): completing an **ACTIVE, not-yet-finished** competition → `409` "Competition has not finished yet" and the competition stays `ACTIVE`; after the `end_time` has passed (emulated by back-dating `start_time`) → `200` `completed` with `winner_id` = the **challenger** when the challenger has more votes (2 vs 1), = the **opponent** when the opponent has more (1 vs 2), and `null` on an **exact tie** (2 vs 2) and on a **zero-vote** competition (0 vs 0, `prize_pool` 0); completing again → `409` "Competition is already completed" with the state byte-for-byte unchanged (no recompute, no corruption); a **completed** competition rejects a further vote → `409` with `total_votes`/`prize_pool` unchanged; completion **preserves** `total_votes` and `prize_pool`, changes **no** coin balances, writes **no** ledger rows, and creates **no** `competition_reward` transaction (distribution is the next feature); every winner is one of the two participants and every draw has `winner_id null`; and a **non-participant** cannot complete a competition → `403` with no state change. All test rows (coin_transactions → votes → competitions → requests → users) are cleaned up afterward.
+
+`test_competition_expiration.py` verifies the automatic completion sweeper (Phase 6, Part 4C follow-up): a single `sweep_expired_competitions()` pass finalizes **multiple** expired ACTIVE competitions at once (challenger-wins, draw, and zero-vote draw all correct; `winner_id null` for ties); a competition that **has not reached `end_time` stays `ACTIVE`** through the sweep; an **already-completed** competition is never reprocessed (a repeated sweep returns `0` and the winner is not recomputed); an auto-completed competition **rejects further votes** with `409` and nothing changes; and the sweep **preserves `prize_pool`**, changes **no** coin balances, writes **no** ledger rows, and creates **no** `competition_reward` transactions. The tests drive the shared sweep function directly (the FastAPI lifespan thread that calls it periodically is not started by the TestClient). All test rows are cleaned up afterward.
 
 ## Seed data
 

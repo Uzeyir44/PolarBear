@@ -6,6 +6,7 @@ retrieval and discovery.
   GET /competitions/{competition_id}   retrieve one competition (200, participant-only)
   GET /competitions                    list the caller's competitions (200)
   GET /competitions/discover           public feed of OTHER users' ACTIVE competitions (200)
+  POST /competitions/{id}/complete     manual completion trigger (200, participant-only)
 
 The detail endpoint only lets the challenger or the opponent in (other
 authenticated users get 403, unauthenticated get 401). GET /competitions is
@@ -38,9 +39,14 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
-from app.models import Competition, CompetitionStatus, User
+from app.models import Competition, User
 from app.schemas.competition import CompetitionDiscoverResult, CompetitionRead
 from app.schemas.user import UserPublic
+from app.services.competition_expiration import (
+    CompletionOutcome,
+    complete_expired_competition,
+    resolve_status_id,
+)
 
 router = APIRouter(prefix="/competitions", tags=["competitions"])
 
@@ -86,12 +92,12 @@ def list_competitions(
 
     if status == "active":
         query = (
-            query.where(Competition.status_id == _status_id(db, "active"))
+            query.where(Competition.status_id == resolve_status_id(db, "active"))
             .order_by(Competition.end_time.asc(), Competition.competition_id.asc())
         )
     elif status == "completed":
         query = (
-            query.where(Competition.status_id == _status_id(db, "completed"))
+            query.where(Competition.status_id == resolve_status_id(db, "completed"))
             .order_by(Competition.end_time.desc(), Competition.competition_id.desc())
         )
     else:
@@ -126,7 +132,7 @@ def discover_competitions(
     # whose challenger or opponent account is inactive. status/participant
     # filters are applied on FK/filter columns (challenger_id/opponent_id),
     # never on anything the client controls.
-    active_id = _status_id(db, "active")
+    active_id = resolve_status_id(db, "active")
     conditions = [
         Competition.status_id == active_id,
         Competition.challenger_id != current_user.user_id,
@@ -194,17 +200,66 @@ def get_competition(
     return _to_competition_read(competition)
 
 
-def _status_id(db: Session, status_name: str) -> int:
-    """Resolve a competition_status lookup id by name (never hardcoding seed ids)."""
-    status_id = db.scalar(
-        select(CompetitionStatus.status_id).where(CompetitionStatus.status_name == status_name)
-    )
-    if status_id is None:
+@router.post("/{competition_id}/complete", response_model=CompetitionRead)
+def complete_competition(
+    competition_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CompetitionRead:
+    """Manually finalize an expired competition and calculate its winner.
+
+    This is an administrative/manual completion trigger. In normal operation
+    the backend's automatic expiration sweeper (services/competition_expiration
+    .run_expiration_sweeper) completes competitions once end_time passes, so
+    the mobile client does not need to call this endpoint. Both paths share the
+    same complete_expired_competition service, so winner/draw determination and
+    the ACTIVE/end_time/status guards are identical.
+
+    Requires authentication; only the two participants may trigger it (403 for
+    anyone else). Completion does NOT distribute the prize pool or touch coins.
+    """
+    competition = db.get(Competition, competition_id)
+    if competition is None:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Competition status '{status_name}' is not configured",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Competition not found",
         )
-    return status_id
+    if (
+        competition.challenger_id != current_user.user_id
+        and competition.opponent_id != current_user.user_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not a participant of this competition",
+        )
+
+    outcome, _ = complete_expired_competition(db, competition_id)
+    if outcome == CompletionOutcome.ALREADY_COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Competition is already completed",
+        )
+    if outcome == CompletionOutcome.NOT_ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Competition is not active",
+        )
+    if outcome == CompletionOutcome.NOT_EXPIRED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Competition has not finished yet",
+        )
+
+    completed = db.execute(
+        select(Competition)
+        .where(Competition.competition_id == competition_id)
+        .options(
+            joinedload(Competition.challenger),
+            joinedload(Competition.opponent),
+            joinedload(Competition.status),
+        )
+    ).scalar_one()
+    return _to_competition_read(completed)
 
 
 def _to_competition_read(competition: Competition) -> CompetitionRead:
